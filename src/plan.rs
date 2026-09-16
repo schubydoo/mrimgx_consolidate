@@ -104,8 +104,9 @@ pub struct MergePlan {
     pub out_file_number: u16,
     /// The increment number the output claims.
     pub out_increment_number: u16,
-    /// Bytes of metadata and padding, estimated from the To file.
-    metadata_bytes: u64,
+    /// Bytes of metadata and footer, estimated from the To file. Crate-visible so that the
+    /// writer's tests can build a plan without a backup set on disk.
+    pub(crate) metadata_bytes: u64,
 }
 
 impl MergePlan {

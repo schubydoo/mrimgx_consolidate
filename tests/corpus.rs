@@ -24,6 +24,7 @@ use mrimgx_consolidate::json;
 use mrimgx_consolidate::plan;
 use mrimgx_consolidate::reader::BackupFile;
 use mrimgx_consolidate::set::BackupSet;
+use mrimgx_consolidate::write;
 
 fn corpus() -> Option<PathBuf> {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata");
@@ -619,4 +620,202 @@ fn the_refusal_rules_use_the_documented_wording() {
 
     // A file number that is not in the set.
     assert!(plan::build(&set, 0, 9).is_err());
+}
+
+/// Read a byte range out of a file. Used to prove a copy against its source.
+fn read_range(path: &Path, at: u64, len: u32) -> Vec<u8> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path).unwrap();
+    f.seek(SeekFrom::Start(at)).unwrap();
+    let mut buf = vec![0u8; len as usize];
+    f.read_exact(&mut buf).unwrap();
+    buf
+}
+
+#[test]
+fn copying_the_data_region_reproduces_every_source_block_exactly() {
+    // The claim the whole design rests on: a block moves between files unchanged. This
+    // reads each written block back out of the output and compares it against the bytes
+    // still sitting in the source file.
+    let Some(dir) = corpus() else {
+        eprintln!("skipping: testdata/ is absent");
+        return;
+    };
+    let target = dir.join("Backup-Set/DD5A77E6B68A6C34-Full-01-01.mrimg");
+    if !target.exists() {
+        eprintln!("skipping: the two-file set is absent");
+        return;
+    }
+
+    let set = BackupSet::discover(&target).unwrap();
+    let plan = plan::build(&set, 0, 1).unwrap();
+
+    // Keep the source entries so each copy can be traced back to where it came from.
+    let sources: Vec<plan::Action> = plan
+        .partitions
+        .iter()
+        .flat_map(|p| p.reserved.iter().chain(p.blocks.iter()).copied())
+        .collect();
+
+    let out_path = tempfile::NamedTempFile::new().unwrap().into_temp_path();
+    {
+        let mut source = write::SourceFiles::open(&set, &plan).unwrap();
+        let file = std::fs::File::create(&out_path).unwrap();
+        let mut out = std::io::BufWriter::new(file);
+        let region = write::write_data_region(&plan, &mut source, &mut out, 1).unwrap();
+        out.into_inner().unwrap().sync_all().unwrap();
+
+        assert_eq!(region.payload_bytes, plan.bytes_to_copy());
+        assert_eq!(region.end, block::align_up(region.payload_bytes));
+        assert_eq!(region.end % block::DATA_ALIGNMENT, 0);
+        assert_eq!(region.partitions.len(), 1);
+
+        // Every written block must equal its source range, byte for byte.
+        let Blocks::Full(written) = &region.partitions[0].index.blocks else {
+            panic!("a synthetic Full carries a full index");
+        };
+        assert_eq!(written.len(), sources.len());
+
+        let mut compared = 0;
+        for (action, entry) in sources.iter().zip(written.iter()) {
+            match action {
+                plan::Action::Hole => {
+                    assert_eq!(*entry, Default::default(), "a hole stays a hole");
+                }
+                plan::Action::Keep(original) => {
+                    assert_eq!(entry, original, "a kept entry is untouched");
+                }
+                plan::Action::Copy(original) => {
+                    assert_eq!(entry.block_length, original.block_length);
+                    assert_eq!(entry.md5_hash, original.md5_hash);
+                    assert_eq!(entry.file_number, 1, "copied blocks belong to the output");
+
+                    let owner = set.owner(original.file_number).unwrap();
+                    let expected = read_range(
+                        &owner.path,
+                        original.file_position as u64,
+                        original.block_length,
+                    );
+                    let actual =
+                        read_range(&out_path, entry.file_position as u64, entry.block_length);
+                    assert_eq!(
+                        actual,
+                        expected,
+                        "block copied from {}",
+                        owner.path.display()
+                    );
+                    compared += 1;
+                }
+            }
+        }
+        assert_eq!(compared, 237, "every live block of this set was compared");
+    }
+
+    let written_len = std::fs::metadata(&out_path).unwrap().len();
+    assert_eq!(written_len % block::DATA_ALIGNMENT, 0);
+    assert_eq!(written_len, block::align_up(plan.bytes_to_copy()));
+}
+
+#[test]
+fn copying_a_compressed_set_moves_the_stored_bytes_untouched() {
+    // A compressed set is the case that would expose any accidental re-encoding, because
+    // the stored bytes are a zstd frame rather than plain data.
+    let Some(dir) = corpus() else {
+        eprintln!("skipping: testdata/ is absent");
+        return;
+    };
+    let target = dir.join("NOPASS/B5D6313DA329C717-NOPASS-02-02.mrimgx");
+    if !target.exists() {
+        eprintln!("skipping: the compressed set is absent");
+        return;
+    }
+
+    let set = BackupSet::discover(&target).unwrap();
+    // Merge only the two small increments, so the test does not copy 3.7 GB.
+    let plan = plan::build(&set, 1, 2).unwrap();
+    assert_eq!(plan.kind, plan::MergeKind::IncrementalMerge);
+
+    let out_path = tempfile::NamedTempFile::new().unwrap().into_temp_path();
+    let mut source = write::SourceFiles::open(&set, &plan).unwrap();
+    let file = std::fs::File::create(&out_path).unwrap();
+    let mut out = std::io::BufWriter::new(file);
+    let region = write::write_data_region(&plan, &mut source, &mut out, 2).unwrap();
+    out.into_inner().unwrap().sync_all().unwrap();
+
+    let Blocks::Delta(deltas) = &region.partitions[0].index.blocks else {
+        panic!("an incremental merge carries a delta index");
+    };
+    assert!(!deltas.is_empty());
+
+    // Spot-check every copied delta block against its source.
+    for (action, delta) in plan.partitions[0].blocks.iter().zip(deltas.iter()) {
+        let plan::Action::Copy(original) = action else {
+            continue;
+        };
+        let owner = set.owner(original.file_number).unwrap();
+        let expected = read_range(
+            &owner.path,
+            original.file_position as u64,
+            original.block_length,
+        );
+        let actual = read_range(
+            &out_path,
+            delta.element.file_position as u64,
+            delta.element.block_length,
+        );
+        assert_eq!(actual, expected);
+    }
+
+    // The reserved sectors are large and compressed. They must move too.
+    assert_eq!(region.partitions[0].index.reserved.len(), 4);
+    for entry in &region.partitions[0].index.reserved {
+        assert_eq!(entry.file_number, 2);
+        assert!(entry.block_length > 0);
+    }
+    assert_eq!(region.end % block::DATA_ALIGNMENT, 0);
+}
+
+/// Copy the whole encrypted set and report throughput.
+///
+/// Ignored by default: it moves about 3.8 GB and needs that much free space. Run it with
+/// `cargo test --release --test corpus -- --ignored --nocapture` when the number matters.
+#[test]
+#[ignore]
+fn merging_a_large_set_runs_at_disk_speed() {
+    let Some(dir) = corpus() else {
+        eprintln!("skipping: testdata/ is absent");
+        return;
+    };
+    let target = dir.join("PASS/E9A7F5B2D6166D7C-NOPASS-02-02.mrimgx");
+    if !target.exists() {
+        eprintln!("skipping: the encrypted set is absent");
+        return;
+    }
+
+    let set = BackupSet::discover(&target).unwrap();
+    let plan = plan::build(&set, 0, 2).unwrap();
+
+    // Write next to the corpus so the measurement reflects the real disk rather than a
+    // memory-backed temporary directory.
+    let out_path = dir.join("merge-throughput.tmp");
+    let started = std::time::Instant::now();
+    {
+        let mut source = write::SourceFiles::open(&set, &plan).unwrap();
+        let file = std::fs::File::create(&out_path).unwrap();
+        let mut out = std::io::BufWriter::with_capacity(1 << 20, file);
+        let region = write::write_data_region(&plan, &mut source, &mut out, 2).unwrap();
+        out.into_inner().unwrap().sync_all().unwrap();
+        assert_eq!(region.payload_bytes, plan.bytes_to_copy());
+    }
+    let elapsed = started.elapsed();
+    let _ = std::fs::remove_file(&out_path);
+
+    let bytes = plan.bytes_to_copy();
+    let rate = bytes as f64 / elapsed.as_secs_f64() / 1_000_000.0;
+    eprintln!(
+        "copied {bytes} bytes in {:.2} s, {rate:.0} MB per second, {} blocks",
+        elapsed.as_secs_f64(),
+        plan.blocks_to_copy()
+    );
+    assert!(rate > 50.0, "throughput fell to {rate:.0} MB per second");
 }
