@@ -1,0 +1,16 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# Working notes, not for publication.
+/scratch/
+
+# Test corpus, fetched from the mrimgx_file_layout repo. Large binaries.
+/testdata/
+
+# Proprietary Macrium binary, kept locally as a behavioral oracle. Never commit.
+Consolidate.exe
+*.mrimg
+*.mrimgx
+*.mrimg.metadata
+*.img
