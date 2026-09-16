@@ -15,3 +15,4 @@ pub mod cli;
 pub mod index;
 pub mod json;
 pub mod reader;
+pub mod set;

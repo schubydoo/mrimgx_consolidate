@@ -8,6 +8,7 @@ use clap::{Parser, Subcommand};
 use crate::index::Blocks;
 use crate::json;
 use crate::reader::BackupFile;
+use crate::set::BackupSet;
 
 #[derive(Parser, Debug)]
 #[command(name = "mrimgx-consolidate", version, about, long_about = None)]
@@ -26,12 +27,81 @@ pub enum Command {
         #[arg(required = true, value_name = "FILE")]
         files: Vec<PathBuf>,
     },
+    /// Resolve a backup set and report where every logical block lives.
+    Resolve {
+        /// Any file of the set. The set is resolved as of this file.
+        #[arg(value_name = "FILE")]
+        file: PathBuf,
+        /// Print one line per block. Large sets produce a lot of output.
+        #[arg(long)]
+        blocks: bool,
+    },
 }
 
 pub fn run() -> Result<()> {
     match Cli::parse().command {
         Command::Inspect { files } => inspect(&files),
+        Command::Resolve { file, blocks } => resolve(&file, blocks),
     }
+}
+
+fn resolve(path: &PathBuf, list_blocks: bool) -> Result<()> {
+    let set = BackupSet::discover(path)?;
+    let flat = set.flatten()?;
+
+    println!("backup set {}", set.newest().header.imageid);
+    println!("  resolved as of  {}", set.newest().path.display());
+    println!("  members         {}", set.members.len());
+    for member in &set.members {
+        let h = &member.header;
+        println!(
+            "    file {:>3}  inc {:>3}  {:<5} {:<6}  {}",
+            h.file_number,
+            h.increment_number,
+            h.backup_type,
+            if h.is_full_index() { "full" } else { "delta" },
+            member.path.display()
+        );
+    }
+
+    let counts = flat.blocks_per_file();
+    let mut owners: Vec<_> = counts.iter().collect();
+    owners.sort();
+    println!(
+        "  live blocks     {}  ({} bytes)",
+        flat.blocks().count(),
+        flat.stored_bytes()
+    );
+    for (file_number, count) in owners {
+        let owner = set
+            .owner(*file_number)
+            .map(|f| f.path.display().to_string())
+            .unwrap_or_else(|| "NO OWNER".to_string());
+        println!("    from file {file_number:>3}  {count:>8} blocks  {owner}");
+    }
+
+    for (d, disk) in flat.disks.iter().enumerate() {
+        for (p, blocks) in disk.iter().enumerate() {
+            let holes = blocks.iter().filter(|e| e.is_hole()).count();
+            println!(
+                "  disk {d} partition {p}  {} logical blocks  {} captured  {holes} holes",
+                blocks.len(),
+                blocks.len() - holes
+            );
+            if list_blocks {
+                for (i, e) in blocks.iter().enumerate() {
+                    if e.is_hole() {
+                        continue;
+                    }
+                    println!(
+                        "    {d}/{p}/{i} file={} at={} len={}",
+                        e.file_number, e.file_position, e.block_length
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn inspect(files: &[PathBuf]) -> Result<()> {
@@ -151,7 +221,9 @@ mod tests {
     fn inspect_accepts_several_files() {
         let cli =
             Cli::try_parse_from(["mrimgx-consolidate", "inspect", "a.mrimg", "b.mrimg"]).unwrap();
-        let Command::Inspect { files } = cli.command;
+        let Command::Inspect { files } = cli.command else {
+            panic!("expected the inspect subcommand");
+        };
         assert_eq!(files.len(), 2);
     }
 
