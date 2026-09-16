@@ -101,16 +101,15 @@ impl BackupFile {
         let json_block = root_list
             .find(block::JSON)
             .context("the root block list holds no $JSON block")?;
+        // The reference reader parses $JSON before it can derive a key, so this block is
+        // never encrypted. It is routinely compressed: every file of a real compressed set
+        // carries the flag, while the uncompressed test corpus never does.
         ensure!(
             !json_block.header.flags.encryption,
             "the $JSON block is marked encrypted, which the format does not allow"
         );
-        ensure!(
-            !json_block.header.flags.compression,
-            "the $JSON block is compressed; this build cannot read it yet"
-        );
 
-        let json_raw = block::read_payload(reader, json_block)?;
+        let json_raw = block::read_block(reader, json_block)?;
         let json = json::parse(&json_raw)?;
         let header = Header::from_value(&json)?;
 

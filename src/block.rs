@@ -36,6 +36,21 @@ pub const AUXDATA: &[u8; NAME_LEN] = b"$AUXDATA";
 /// blocks per list.
 const MAX_BLOCKS_PER_LIST: usize = 64;
 
+/// The data region is padded up to a multiple of this before the metadata region starts,
+/// so `_header.index_file_position` is always a multiple of it.
+///
+/// Measured, not documented. It holds on all sixteen files of both test sets, which
+/// between them cover uncompressed and high-compression, MBR and GPT, FAT and NTFS, and
+/// sizes from 3 MB to 3.7 GB. The uncompressed corpus hides the padding, because
+/// uncompressed blocks land on the boundary anyway and the gap is zero. A compressed set
+/// shows gaps of 1222, 2376 and 3816 bytes.
+pub const DATA_ALIGNMENT: u64 = 4096;
+
+/// Round `offset` up to the next [`DATA_ALIGNMENT`] boundary.
+pub fn align_up(offset: u64) -> u64 {
+    offset.div_ceil(DATA_ALIGNMENT) * DATA_ALIGNMENT
+}
+
 /// The three flag bits packed into byte 28 of a block header.
 ///
 /// The remaining five bits are unused and are written as zero.
@@ -247,7 +262,38 @@ pub fn walk_list<R: Read + Seek>(reader: &mut R, start: u64) -> Result<BlockList
     }
 }
 
+/// Read a block's payload and undo whatever its flags say was done to it.
+///
+/// The order matters and follows the reference `readBlock`: hash first, then decrypt, then
+/// decompress. `hash` covers the stored bytes, so it is checked before anything is undone.
+/// That way a corrupt block is reported as corrupt rather than as a decompression failure.
+///
+/// Encrypted metadata blocks are not supported yet and are reported rather than guessed at.
+pub fn read_block<R: Read + Seek>(reader: &mut R, block: &Located) -> Result<Vec<u8>> {
+    let stored = read_payload(reader, block)?;
+    let name = block.header.name_str();
+
+    if md5(&stored) != block.header.hash {
+        bail!("Block hash mismatch. ({name} at offset {})", block.offset);
+    }
+
+    ensure!(
+        !block.header.flags.encryption,
+        "the {name} block is encrypted; this build cannot decrypt metadata yet"
+    );
+
+    if block.header.flags.compression {
+        // The frame header carries the content size, so the decoder needs no hint.
+        return zstd::decode_all(stored.as_slice())
+            .with_context(|| format!("Failed to decompress block. ({name})"));
+    }
+    Ok(stored)
+}
+
 /// Read a block's payload exactly as stored, with no decompression and no decryption.
+///
+/// This is what a verbatim copy uses. Nothing is checked, because the stored bytes are the
+/// thing being preserved.
 pub fn read_payload<R: Read + Seek>(reader: &mut R, block: &Located) -> Result<Vec<u8>> {
     reader.seek(SeekFrom::Start(block.payload_at()))?;
     let mut buf = vec![0u8; block.header.block_length as usize];

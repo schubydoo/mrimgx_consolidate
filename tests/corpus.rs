@@ -92,9 +92,10 @@ fn every_corpus_json_payload_round_trips_byte_for_byte() {
 }
 
 #[test]
-fn the_data_region_is_contiguous_from_offset_zero() {
-    // On every corpus file the last byte of the last owned block sits exactly at
-    // index_file_position. No padding, no alignment. The writer relies on this.
+fn the_metadata_region_starts_on_the_next_aligned_boundary_after_the_data() {
+    // The writer must reproduce this exactly. The uncompressed corpus hides it, because
+    // uncompressed blocks end on the boundary anyway and the gap reads as zero. A real
+    // compressed set shows gaps of one to four kilobytes.
     let files = all_files();
     if files.is_empty() {
         eprintln!("skipping: testdata/ is absent");
@@ -102,11 +103,22 @@ fn the_data_region_is_contiguous_from_offset_zero() {
     }
     for path in &files {
         let file = BackupFile::open(path, true).unwrap();
+        let data_end = file.own_data_end();
+        let ifp = file.header.index_file_position;
         assert_eq!(
-            file.own_data_end(),
-            file.header.index_file_position,
-            "{}: data region does not end at index_file_position",
-            path.display()
+            ifp % block::DATA_ALIGNMENT,
+            0,
+            "{}: index_file_position {ifp} is not a multiple of {}",
+            path.display(),
+            block::DATA_ALIGNMENT
+        );
+        assert_eq!(
+            ifp,
+            block::align_up(data_end),
+            "{}: data ends at {data_end}, so the metadata region should start at {} \
+             but starts at {ifp}",
+            path.display(),
+            block::align_up(data_end)
         );
     }
 }
@@ -223,6 +235,69 @@ fn flattening_the_multi_partition_set_is_stable_at_every_resolution_point() {
         previous_live = live;
     }
     assert_eq!(previous_live, 676);
+}
+
+#[test]
+fn a_real_compressed_set_parses_and_resolves() {
+    // The uncompressed corpus never sets the compression flag on $JSON, so a reader built
+    // only against it refuses every real file. This set catches that.
+    let Some(dir) = corpus() else {
+        eprintln!("skipping: testdata/ is absent");
+        return;
+    };
+    let target = dir.join("NOPASS/B5D6313DA329C717-NOPASS-02-02.mrimgx");
+    if !target.exists() {
+        eprintln!("skipping: the compressed set is absent");
+        return;
+    }
+
+    let newest = BackupFile::open(&target, true).unwrap();
+    assert!(
+        newest
+            .root_list
+            .find(block::JSON)
+            .unwrap()
+            .header
+            .flags
+            .compression,
+        "this set is supposed to have a compressed $JSON block"
+    );
+
+    let set = BackupSet::discover(&target).unwrap();
+    assert_eq!(set.members.len(), 3);
+    let flat = set.flatten().unwrap();
+    for e in flat.blocks() {
+        assert!(set.owner(e.file_number).is_some());
+    }
+    assert_eq!(flat.blocks().count(), 55806);
+}
+
+#[test]
+fn every_file_owns_its_whole_reserved_sector_array() {
+    // buildIndex merges only data_blocks, and the restore takes the reserved array
+    // wholesale from the newest file. That only works because each file re-stores its own
+    // reserved sectors in full. The writer copies this array rather than flattening it.
+    let files = all_files();
+    if files.is_empty() {
+        eprintln!("skipping: testdata/ is absent");
+        return;
+    }
+    for path in &files {
+        let file = BackupFile::open(path, true).unwrap();
+        for disk in &file.disks {
+            for part in &disk.partitions {
+                for e in part.index.reserved.iter().filter(|e| !e.is_hole()) {
+                    assert_eq!(
+                        e.file_number,
+                        file.header.file_number,
+                        "{}: a reserved sector block names file {} rather than its own",
+                        path.display(),
+                        e.file_number
+                    );
+                }
+            }
+        }
+    }
 }
 
 #[test]

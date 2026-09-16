@@ -28,6 +28,12 @@ serde_json = "1"
 # chose it, not us.
 md-5 = "0.10"
 
+# Every compressed block is an independent zstd frame whose header carries the content
+# size, because the reference reader calls ZSTD_getFrameContentSize on it. Consolidation
+# copies data blocks without decompressing them, so this is only needed for metadata
+# blocks and for the optional end-to-end verify.
+zstd = "0.13"
+
 [dev-dependencies]
 tempfile = "3"
 
