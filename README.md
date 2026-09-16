@@ -60,9 +60,14 @@ to its offset in the file, and that position does not change.
 
 ## Safety
 
-The tool never modifies a source file. It writes to a temporary file, flushes it to disk,
-and renames it into place. It deletes nothing unless you pass an explicit flag, and then
-only after the output passes a read-back test.
+The tool never modifies a source file. It writes to a temporary file in the destination
+directory, flushes it, and renames it into place. It deletes nothing unless you pass an
+explicit flag, and then only after re-opening the output and re-reading it.
+
+That read-back is not a formality. On an NFS or SMB mount, flushing a directory is a no-op
+that reports success. A rename that returns an error on such a mount sometimes succeeded
+anyway. So on a network share the read-back is the only trustworthy confirmation, and
+deletion waits for it rather than for the rename.
 
 ## License
 
