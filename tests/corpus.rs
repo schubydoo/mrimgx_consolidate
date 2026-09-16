@@ -390,6 +390,63 @@ fn every_file_owns_its_whole_reserved_sector_array() {
 }
 
 #[test]
+fn disk_size_is_not_stable_across_a_set() {
+    // A trap, recorded as a test so that it is not rediscovered the hard way.
+    //
+    // A Full records the true device size. An Incremental of the same set records the
+    // size derived from the CHS geometry, which is smaller because it rounds down to a
+    // whole cylinder. Every file of a set carries identical cylinder, head and sector
+    // fields, so only disk_size disagrees.
+    //
+    // A synthetic Full must therefore take disk_size from the file carrying the full
+    // index, never from the To file. Otherwise the output claims a smaller disk than the
+    // original, and a restore of the output truncates the tail of the device.
+    let files = all_files();
+    if files.is_empty() {
+        eprintln!("skipping: testdata/ is absent");
+        return;
+    }
+
+    let mut fulls = 0;
+    let mut increments = 0;
+    for path in &files {
+        let file = BackupFile::open(path, false).unwrap();
+        let g = &file.json["disks"][0]["_geometry"];
+        let field = |k: &str| g[k].as_u64().unwrap_or(0);
+        let chs = field("cylinders")
+            * field("sectors_per_track")
+            * field("tracks_per_cylinder")
+            * field("bytes_per_sector");
+        if chs == 0 {
+            continue;
+        }
+        let disk_size = field("disk_size");
+        if file.header.is_full_index() {
+            // The true device size is at or above the cylinder-aligned size.
+            assert!(
+                disk_size >= chs,
+                "{}: a Full reports disk_size {disk_size} below its CHS size {chs}",
+                path.display()
+            );
+            fulls += 1;
+        } else {
+            assert_eq!(
+                disk_size,
+                chs,
+                "{}: an Incremental should report the CHS-derived size",
+                path.display()
+            );
+            increments += 1;
+        }
+    }
+    assert!(
+        fulls > 0 && increments > 0,
+        "the corpus must cover both cases"
+    );
+    eprintln!("checked {fulls} full-index files and {increments} increments");
+}
+
+#[test]
 fn a_set_resolved_as_of_the_full_holds_only_the_full() {
     let Some(dir) = corpus() else {
         eprintln!("skipping: testdata/ is absent");
