@@ -7,6 +7,7 @@ use clap::{Parser, Subcommand};
 
 use crate::index::Blocks;
 use crate::json;
+use crate::plan::{self, MergeKind};
 use crate::reader::BackupFile;
 use crate::set::BackupSet;
 
@@ -27,6 +28,20 @@ pub enum Command {
         #[arg(required = true, value_name = "FILE")]
         files: Vec<PathBuf>,
     },
+    /// Report what merging a range of a backup set moves.
+    ///
+    /// Only `--dry-run` works today. The writer is not implemented yet.
+    Consolidate {
+        /// The first file of the range. Usually the Full.
+        #[arg(long, value_name = "FILE")]
+        from: PathBuf,
+        /// The last file of the range. It must be the newest file of the set.
+        #[arg(long, value_name = "FILE")]
+        to: PathBuf,
+        /// Report the plan and write nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Resolve a backup set and report where every logical block lives.
     Resolve {
         /// Any file of the set. The set is resolved as of this file.
@@ -42,6 +57,99 @@ pub fn run() -> Result<()> {
     match Cli::parse().command {
         Command::Inspect { files } => inspect(&files),
         Command::Resolve { file, blocks } => resolve(&file, blocks),
+        Command::Consolidate { from, to, dry_run } => consolidate(&from, &to, dry_run),
+    }
+}
+
+fn consolidate(from: &PathBuf, to: &PathBuf, dry_run: bool) -> Result<()> {
+    // The set is resolved as of the To file, so discovery starts there.
+    let set = BackupSet::discover(to)?;
+    let from_file = BackupFile::open(from, false)?;
+    let to_file = BackupFile::open(to, false)?;
+    let plan = plan::build(
+        &set,
+        from_file.header.file_number,
+        to_file.header.file_number,
+    )?;
+
+    print_plan(&set, &plan);
+
+    if !dry_run {
+        anyhow::bail!(
+            "the writer is not implemented yet, so only --dry-run works. \
+             The plan above is what a merge would move."
+        );
+    }
+    Ok(())
+}
+
+fn print_plan(set: &BackupSet, plan: &plan::MergePlan) {
+    let kind = match plan.kind {
+        MergeKind::SyntheticFull => "a synthetic full",
+        MergeKind::IncrementalMerge => "an incremental merge",
+    };
+    println!("backup set {}", set.newest().header.imageid);
+    println!("  merge            files {} through {}", plan.from, plan.to);
+    println!("  produces         {kind}");
+    println!(
+        "  output claims    file {} increment {}",
+        plan.out_file_number, plan.out_increment_number
+    );
+    println!(
+        "  absorbs          {}",
+        plan.redundant_file_numbers()
+            .iter()
+            .map(u16::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    println!(
+        "  blocks to copy   {}  ({} bytes)",
+        plan.blocks_to_copy(),
+        plan.bytes_to_copy()
+    );
+    println!("  blocks kept      {}", plan.blocks_kept());
+    println!("  holes            {}", plan.holes());
+    println!("  projected size   {} bytes", plan.projected_size());
+
+    let current: u64 = plan
+        .redundant_file_numbers()
+        .iter()
+        .filter_map(|n| set.owner(*n))
+        .map(|f| f.size)
+        .sum();
+    if current > 0 {
+        let projected = plan.projected_size();
+        println!("  files absorbed   {current} bytes on disk");
+        if current > projected {
+            println!("  reclaims         {} bytes", current - projected);
+        } else {
+            println!("  reclaims         nothing. The merge grows the set");
+        }
+    }
+
+    for part in &plan.partitions {
+        let copies = part
+            .reserved
+            .iter()
+            .chain(part.blocks.iter())
+            .filter(|a| a.is_copy())
+            .count();
+        let reserved_copies = part.reserved.iter().filter(|a| a.is_copy()).count();
+        println!(
+            "  disk {} partition {}  {} entries, {copies} copied ({reserved_copies} reserved)",
+            part.disk,
+            part.partition,
+            part.blocks.len()
+        );
+    }
+
+    println!();
+    println!("  These files become redundant once the output is in place:");
+    for number in plan.redundant_file_numbers() {
+        if let Some(owner) = set.owner(number) {
+            println!("    file {number:>3}  {}", owner.path.display());
+        }
     }
 }
 

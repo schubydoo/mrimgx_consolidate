@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use mrimgx_consolidate::block;
 use mrimgx_consolidate::index::Blocks;
 use mrimgx_consolidate::json;
+use mrimgx_consolidate::plan;
 use mrimgx_consolidate::reader::BackupFile;
 use mrimgx_consolidate::set::BackupSet;
 
@@ -466,4 +467,156 @@ fn a_set_resolved_as_of_the_full_holds_only_the_full() {
         flat.blocks_per_file().keys().copied().collect::<Vec<_>>(),
         vec![0]
     );
+}
+
+#[test]
+fn planning_a_synthetic_full_moves_every_live_block() {
+    // From is the Full, so every block resolves into the merge and nothing keeps an old
+    // reference. The counts come from `resolve` on the same set.
+    let Some(dir) = corpus() else {
+        eprintln!("skipping: testdata/ is absent");
+        return;
+    };
+    let target = dir.join("Backup-Set/DD5A77E6B68A6C34-Full-01-01.mrimg");
+    if !target.exists() {
+        eprintln!("skipping: the two-file set is absent");
+        return;
+    }
+
+    let set = BackupSet::discover(&target).unwrap();
+    let plan = plan::build(&set, 0, 1).unwrap();
+
+    assert_eq!(plan.kind, plan::MergeKind::SyntheticFull);
+    assert!(
+        !plan.kind.delta_index(),
+        "a synthetic Full carries a full index"
+    );
+    assert_eq!(plan.kind.consolidation_type(), "synthetic_full");
+    assert_eq!(plan.redundant_file_numbers(), vec![0, 1]);
+    assert_eq!(plan.blocks_to_copy(), 237);
+    assert_eq!(plan.blocks_kept(), 0, "nothing survives a full merge");
+    assert_eq!(plan.bytes_to_copy(), 15532032);
+    assert!(plan.projected_size() > plan.bytes_to_copy());
+}
+
+#[test]
+fn planning_a_middle_range_keeps_the_blocks_it_does_not_absorb() {
+    // The four-file set resolved as of file 3 draws 561, 43, 27 and 45 blocks from its
+    // four members. Merging from file 1 leaves the Full's 561 blocks alone.
+    let Some(dir) = corpus() else {
+        eprintln!("skipping: testdata/ is absent");
+        return;
+    };
+    let target = dir.join("Backup-Set-MP/584221F3840B0DBE-MP-Full-03-03.mrimg");
+    if !target.exists() {
+        eprintln!("skipping: the multi-partition set is absent");
+        return;
+    }
+
+    let set = BackupSet::discover(&target).unwrap();
+
+    let full = plan::build(&set, 0, 3).unwrap();
+    assert_eq!(full.kind, plan::MergeKind::SyntheticFull);
+    assert_eq!(full.blocks_to_copy(), 676);
+    assert_eq!(full.blocks_kept(), 0);
+
+    let from_one = plan::build(&set, 1, 3).unwrap();
+    assert_eq!(from_one.kind, plan::MergeKind::IncrementalMerge);
+    assert!(from_one.kind.delta_index());
+    assert_eq!(from_one.redundant_file_numbers(), vec![1, 2, 3]);
+    assert_eq!(from_one.blocks_to_copy(), 43 + 27 + 45);
+
+    let from_two = plan::build(&set, 2, 3).unwrap();
+    assert_eq!(from_two.blocks_to_copy(), 27 + 45);
+    assert_eq!(from_two.redundant_file_numbers(), vec![2, 3]);
+
+    // Merging from later in the chain always moves less.
+    assert!(full.bytes_to_copy() > from_one.bytes_to_copy());
+    assert!(from_one.bytes_to_copy() > from_two.bytes_to_copy());
+}
+
+#[test]
+fn planning_an_incremental_merge_names_only_the_changed_positions() {
+    // The output of an incremental merge holds a delta index. It must name every position
+    // the absorbed members changed, and no more.
+    let Some(dir) = corpus() else {
+        eprintln!("skipping: testdata/ is absent");
+        return;
+    };
+    let target = dir.join("Backup-Set-MP/584221F3840B0DBE-MP-Full-03-03.mrimg");
+    if !target.exists() {
+        eprintln!("skipping: the multi-partition set is absent");
+        return;
+    }
+
+    let set = BackupSet::discover(&target).unwrap();
+    let plan = plan::build(&set, 2, 3).unwrap();
+
+    for part in &plan.partitions {
+        assert_eq!(
+            part.positions.len(),
+            part.blocks.len(),
+            "every entry of a delta index needs its logical position"
+        );
+        let mut sorted = part.positions.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted, part.positions, "positions ascend and never repeat");
+    }
+}
+
+#[test]
+fn planning_a_compressed_and_an_encrypted_set_reports_real_totals() {
+    let Some(dir) = corpus() else {
+        eprintln!("skipping: testdata/ is absent");
+        return;
+    };
+    for (name, expected) in [
+        ("NOPASS/B5D6313DA329C717-NOPASS-02-02.mrimgx", 55806usize),
+        ("PASS/E9A7F5B2D6166D7C-NOPASS-02-02.mrimgx", 62127),
+    ] {
+        let target = dir.join(name);
+        if !target.exists() {
+            eprintln!("skipping: {name} is absent");
+            continue;
+        }
+        let set = BackupSet::discover(&target).unwrap();
+        let plan = plan::build(&set, 0, 2).unwrap();
+        assert_eq!(plan.kind, plan::MergeKind::SyntheticFull);
+        // Reserved sector blocks move too, on top of the live data blocks.
+        assert!(
+            plan.blocks_to_copy() >= expected,
+            "{name}: expected at least {expected} blocks, planned {}",
+            plan.blocks_to_copy()
+        );
+        assert_eq!(plan.blocks_kept(), 0);
+    }
+}
+
+#[test]
+fn the_refusal_rules_use_the_documented_wording() {
+    let Some(dir) = corpus() else {
+        eprintln!("skipping: testdata/ is absent");
+        return;
+    };
+    let target = dir.join("Backup-Set/DD5A77E6B68A6C34-Full-01-01.mrimg");
+    if !target.exists() {
+        eprintln!("skipping: the two-file set is absent");
+        return;
+    }
+    let set = BackupSet::discover(&target).unwrap();
+
+    // Reversed order.
+    let err = plan::build(&set, 1, 0).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("From file is more recent than the To file"),
+        "{err:#}"
+    );
+
+    // The same file twice.
+    let err = plan::build(&set, 1, 1).unwrap_err();
+    assert!(format!("{err:#}").contains("nothing to merge"), "{err:#}");
+
+    // A file number that is not in the set.
+    assert!(plan::build(&set, 0, 9).is_err());
 }
