@@ -36,6 +36,7 @@ zstd = "0.13"
 
 [dev-dependencies]
 tempfile = "3"
+serde_json = "1"
 
 [profile.release]
 # One small static binary is the point: this replaces a 10 MB Windows GUI tool.

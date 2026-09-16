@@ -273,6 +273,95 @@ fn a_real_compressed_set_parses_and_resolves() {
 }
 
 #[test]
+fn an_encrypted_set_parses_and_resolves_without_a_password() {
+    // This is the claim the whole design rests on. Only data blocks are encrypted, so
+    // every offset a consolidation needs is readable without a key, and the merge itself
+    // never has to decrypt anything.
+    let Some(dir) = corpus() else {
+        eprintln!("skipping: testdata/ is absent");
+        return;
+    };
+    let target = dir.join("PASS/E9A7F5B2D6166D7C-NOPASS-02-02.mrimgx");
+    if !target.exists() {
+        eprintln!("skipping: the encrypted set is absent");
+        return;
+    }
+
+    let newest = BackupFile::open(&target, true).unwrap();
+    assert_eq!(
+        newest.json["_encryption"]["enable"],
+        serde_json::Value::Bool(true),
+        "this set is supposed to be encrypted"
+    );
+    // $JSON is never encrypted: the reader must parse it before it can derive a key.
+    assert!(
+        !newest
+            .root_list
+            .find(block::JSON)
+            .unwrap()
+            .header
+            .flags
+            .encryption
+    );
+
+    let set = BackupSet::discover(&target).unwrap();
+    assert_eq!(set.members.len(), 3);
+    let flat = set.flatten().unwrap();
+    assert_eq!(flat.blocks().count(), 62127);
+
+    // Every member contributes, which is what makes this set worth keeping: the
+    // uncompressed corpus and the NOPASS set both have near-empty increments.
+    let counts = flat.blocks_per_file();
+    assert_eq!(counts[&0], 53503);
+    assert_eq!(counts[&1], 4148);
+    assert_eq!(counts[&2], 4476);
+}
+
+#[test]
+fn no_metadata_block_this_crate_must_read_is_ever_encrypted() {
+    // $BITMAP is the only block that carries the encryption flag anywhere in the corpus,
+    // and it is empty, because a bitmap exists only for exFAT and ReFS. A non-empty
+    // encrypted $BITMAP is still untested. The writer copies it verbatim and so does not
+    // care, but inspect would refuse it.
+    let files = all_files();
+    if files.is_empty() {
+        eprintln!("skipping: testdata/ is absent");
+        return;
+    }
+    for path in &files {
+        let file = BackupFile::open(path, true).unwrap();
+        for located in &file.root_list.blocks {
+            if located.header.flags.encryption {
+                assert_eq!(
+                    located.header.block_length,
+                    0,
+                    "{}: a non-empty encrypted {} block in the root list",
+                    path.display(),
+                    located.header.name_str()
+                );
+            }
+        }
+        for disk in &file.disks {
+            let lists =
+                std::iter::once(&disk.blocks).chain(disk.partitions.iter().map(|p| &p.blocks));
+            for list in lists {
+                for located in &list.blocks {
+                    if located.header.flags.encryption {
+                        assert_eq!(
+                            located.header.block_length,
+                            0,
+                            "{}: a non-empty encrypted {} block",
+                            path.display(),
+                            located.header.name_str()
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn every_file_owns_its_whole_reserved_sector_array() {
     // buildIndex merges only data_blocks, and the restore takes the reserved array
     // wholesale from the newest file. That only works because each file re-stores its own
