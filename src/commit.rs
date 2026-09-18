@@ -89,6 +89,38 @@ impl Drop for Lock {
     }
 }
 
+/// The prefix every temporary output carries.
+const TEMP_PREFIX: &str = "macrium_consolidation_temp-";
+
+/// Remove what a killed run left in `directory`: the lock, and any temporary output.
+///
+/// Returns the paths that were removed. A run that was killed leaves both behind on
+/// purpose, because a partly written file that nobody notices is worse than one that is
+/// named in a report.
+pub fn clear_leftovers(directory: &Path) -> Result<Vec<PathBuf>> {
+    let mut removed = Vec::new();
+    if Lock::clear(directory)? {
+        removed.push(directory.join(LOCK_NAME));
+    }
+
+    let entries =
+        std::fs::read_dir(directory).with_context(|| format!("listing {}", directory.display()))?;
+    for entry in entries {
+        let path = entry
+            .with_context(|| format!("reading an entry of {}", directory.display()))?
+            .path();
+        let is_leftover = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(TEMP_PREFIX));
+        if is_leftover {
+            std::fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
+            removed.push(path);
+        }
+    }
+    Ok(removed)
+}
+
 /// File system types that are network mounts.
 const REMOTE: &[&str] = &[
     "9p",
@@ -293,7 +325,7 @@ impl TempOutput {
             .parent()
             .with_context(|| format!("{} has no parent directory", destination.display()))?;
         let named = tempfile::Builder::new()
-            .prefix("macrium_consolidation_temp-")
+            .prefix(TEMP_PREFIX)
             .suffix(".tmp")
             .tempfile_in(directory)
             .with_context(|| format!("creating a temporary file in {}", directory.display()))?;

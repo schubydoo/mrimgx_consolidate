@@ -86,16 +86,16 @@ fn consolidate(
             .or(Some(to))
             .and_then(Path::parent)
             .unwrap_or(Path::new("."));
-        return match commit::Lock::clear(directory)? {
-            true => {
-                println!("cleared the lock in {}", directory.display());
-                Ok(())
+        let removed = commit::clear_leftovers(directory)?;
+        if removed.is_empty() {
+            println!("nothing to recover in {}", directory.display());
+        } else {
+            println!("cleared what a killed run left in {}:", directory.display());
+            for path in removed {
+                println!("    {}", path.display());
             }
-            false => {
-                println!("no lock in {}", directory.display());
-                Ok(())
-            }
-        };
+        }
+        return Ok(());
     }
 
     // The two-file rules run first, so that a From file newer than the To file is reported

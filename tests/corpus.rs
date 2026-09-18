@@ -1198,6 +1198,69 @@ fn extract(oracle: &Path, backup: &Path, image: &Path) {
     );
 }
 
+/// The temporary output a run left in `directory`, if there is one.
+fn leftover_temp(directory: &Path) -> Option<PathBuf> {
+    std::fs::read_dir(directory)
+        .unwrap()
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("macrium_consolidation_temp-"))
+        })
+}
+
+/// How many bytes a running process has written, from `/proc/<pid>/io`.
+///
+/// The length of the temporary file cannot be used: the run reserves its space up front, so
+/// the file is full size from the start. This counts bytes handed to write calls instead.
+fn bytes_written_by(pid: u32) -> u64 {
+    let Ok(text) = std::fs::read_to_string(format!("/proc/{pid}/io")) else {
+        return 0;
+    };
+    text.lines()
+        .find_map(|line| line.strip_prefix("wchar: "))
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// Start a merge, kill it once `fraction` of the output is written, and report how far it
+/// got.
+///
+/// The kill is a SIGKILL, so nothing runs on the way out: no cleanup, no lock release. That
+/// is the case this test exists for.
+fn kill_part_way(from: &Path, to: &Path, out: &Path, fraction: f64, expected: u64) -> u64 {
+    let stop_at = (expected as f64 * fraction) as u64;
+
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_mrimgx-consolidate"))
+        .arg("consolidate")
+        .arg("--from")
+        .arg(from)
+        .arg("--to")
+        .arg(to)
+        .arg("--out")
+        .arg(out)
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+
+    let mut written;
+    loop {
+        written = bytes_written_by(child.id());
+        if written >= stop_at {
+            break;
+        }
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "the merge finished before it could be killed at {fraction}"
+        );
+    }
+
+    child.kill().unwrap();
+    child.wait().unwrap();
+    written
+}
+
 /// Merge a range through the shipped command.
 fn merge(from: &Path, to: &Path, out: &Path) {
     let run = std::process::Command::new(env!("CARGO_BIN_EXE_mrimgx-consolidate"))
@@ -1237,6 +1300,126 @@ fn compare_images(chain: &Path, merged: &Path) {
             && merge_bytes[common..].iter().all(|b| *b == 0),
         "the tail past the end of the shorter image is not empty"
     );
+}
+
+#[test]
+fn a_killed_merge_damages_nothing_and_recovery_clears_it() {
+    // The failure that matters. A run killed part way through must leave every source byte
+    // for byte as it was, no output in place, and its leftovers where a person can see them.
+    let Some(dir) = corpus() else {
+        eprintln!("skipping: testdata/ is absent");
+        return;
+    };
+    let source_dir = dir.join("Backup-Set-MP");
+    let name = |n: &str| format!("584221F3840B0DBE-MP-Full-{n}.mrimg");
+    if !source_dir.join(name("02-02")).exists() {
+        eprintln!("skipping: the multi-partition set is absent");
+        return;
+    }
+
+    // The sources are copies, so a failure damages nothing that matters.
+    let work = tempfile::tempdir().unwrap();
+    for part in ["00-00", "01-01", "02-02"] {
+        std::fs::copy(source_dir.join(name(part)), work.path().join(name(part))).unwrap();
+    }
+    let member = |n: &str| work.path().join(name(n));
+    let before: Vec<Vec<u8>> = ["00-00", "01-01", "02-02"]
+        .iter()
+        .map(|part| std::fs::read(member(part)).unwrap())
+        .collect();
+
+    let out_dir = tempfile::tempdir().unwrap();
+    let out_path = out_dir.path().join("MERGED-00-00.mrimg");
+    let set = BackupSet::discover(member("02-02")).unwrap();
+    let expected = plan::build(&set, 0, 2).unwrap().projected_size();
+
+    // What the chain restores to before any of this, to compare against afterwards.
+    let baseline = refextract().map(|oracle| {
+        let image = work.path().join("baseline.img");
+        extract(&oracle, &member("02-02"), &image);
+        image
+    });
+
+    for fraction in [0.1, 0.5, 0.9] {
+        let written = kill_part_way(
+            &member("00-00"),
+            &member("02-02"),
+            &out_path,
+            fraction,
+            expected,
+        );
+        assert!(
+            written > 0 && written < expected,
+            "killed after {written} of {expected} bytes, which is not part way through"
+        );
+
+        // Nothing is in place, and the leftovers are where a person can find them.
+        assert!(!out_path.exists(), "a killed run leaves no output");
+        assert!(
+            out_dir.path().join("merge_running").exists(),
+            "the lock survives, so the next run stops and says why"
+        );
+        let temp = leftover_temp(out_dir.path()).expect("the temporary file survives");
+
+        // Every source is untouched, and the chain still resolves.
+        let after: Vec<Vec<u8>> = ["00-00", "01-01", "02-02"]
+            .iter()
+            .map(|part| std::fs::read(member(part)).unwrap())
+            .collect();
+        assert_eq!(before, after, "a source changed during a killed run");
+        let still = BackupSet::discover(member("02-02")).unwrap();
+        assert_eq!(still.members.len(), 3);
+        still.flatten().unwrap();
+
+        // The independent extractor still restores the chain, which is the claim a person
+        // actually cares about after a failed merge.
+        if let Some(oracle) = refextract() {
+            let image = work.path().join("after-kill.img");
+            extract(&oracle, &member("02-02"), &image);
+            if let Some(first) = &baseline {
+                assert_eq!(
+                    std::fs::read(&image).unwrap(),
+                    std::fs::read(first).unwrap(),
+                    "the chain extracts differently after a killed run"
+                );
+            }
+        }
+
+        // A second run refuses while the lock is there.
+        let blocked = std::process::Command::new(env!("CARGO_BIN_EXE_mrimgx-consolidate"))
+            .arg("consolidate")
+            .arg("--from")
+            .arg(member("00-00"))
+            .arg("--to")
+            .arg(member("02-02"))
+            .arg("--out")
+            .arg(&out_path)
+            .output()
+            .unwrap();
+        assert!(!blocked.status.success());
+
+        // Recovery clears both leftovers.
+        let recovered = std::process::Command::new(env!("CARGO_BIN_EXE_mrimgx-consolidate"))
+            .arg("consolidate")
+            .arg("--recover")
+            .arg("--from")
+            .arg(member("00-00"))
+            .arg("--to")
+            .arg(member("02-02"))
+            .arg("--out")
+            .arg(&out_path)
+            .output()
+            .unwrap();
+        assert!(recovered.status.success());
+        assert!(!out_dir.path().join("merge_running").exists());
+        assert!(!temp.exists(), "the temporary file is gone");
+    }
+
+    // And after all that, the merge runs and produces a file that reads back.
+    merge(&member("00-00"), &member("02-02"), &out_path);
+    let output = BackupFile::open(&out_path, true).unwrap();
+    output.check_framing().unwrap();
+    assert_eq!(output.header.merged_files, vec![0, 1]);
 }
 
 #[test]
