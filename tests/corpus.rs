@@ -1230,6 +1230,16 @@ fn leftover_temp(directory: &Path) -> Option<PathBuf> {
         })
 }
 
+/// Whether this system has the per-process byte counters the two timing tests need.
+///
+/// `/proc/<pid>/io` is Linux only. On macOS and on FreeBSD the read returns nothing, the
+/// counter reads zero, and a test built on it either hangs or reports a false pass. So the
+/// two tests that need it skip instead, and the Linux cell of continuous integration is
+/// what proves that behavior.
+fn has_process_io_counters() -> bool {
+    cfg!(target_os = "linux")
+}
+
 /// How many bytes a running process has written, from `/proc/<pid>/io`.
 ///
 /// The length of the temporary file cannot be used: the run reserves its space up front, so
@@ -1525,6 +1535,10 @@ fn scan_and_count_reads(directory: &Path) -> u64 {
 
 #[test]
 fn a_scan_reports_what_a_merge_would_reclaim_and_reads_no_data_block() {
+    if !has_process_io_counters() {
+        eprintln!("skipping: /proc/<pid>/io, which counts the reads, is Linux only");
+        return;
+    }
     let Some(dir) = corpus() else {
         eprintln!("skipping: testdata/ is absent");
         return;
@@ -1928,6 +1942,10 @@ fn the_end_to_end_test_decrypts_and_decompresses_the_encrypted_set() {
 fn a_killed_merge_damages_nothing_and_recovery_clears_it() {
     // The failure that matters. A run killed part way through must leave every source byte
     // for byte as it was, no output in place, and its leftovers where a person can see them.
+    if !has_process_io_counters() {
+        eprintln!("skipping: /proc/<pid>/io, which times the kill, is Linux only");
+        return;
+    }
     let Some(dir) = corpus() else {
         eprintln!("skipping: testdata/ is absent");
         return;
