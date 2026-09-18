@@ -280,6 +280,30 @@ pub fn free_space(directory: &Path) -> Result<u64> {
 /// megabytes covers that and leaves the destination with room to write its own metadata.
 const SPACE_MARGIN: u64 = 16 * 1024 * 1024;
 
+/// The largest file a FAT32 volume can hold, one byte short of four gibibytes.
+const FAT32_LIMIT: u64 = 4 * 1024 * 1024 * 1024 - 1;
+
+/// Make sure that the destination can hold a file of `size`.
+///
+/// FAT32 is the case that matters. A merged output is usually larger than any file of the
+/// set, so a merge that would work anywhere else fails part way through on FAT32. The
+/// original tool refuses a FAT32 destination outright.
+pub fn check_file_size_limit(mount: &Mount, size: u64) -> Result<()> {
+    let file_system = match mount {
+        Mount::Local { file_system } | Mount::Remote { file_system } => file_system.as_str(),
+        Mount::Unknown => return Ok(()),
+    };
+    if !matches!(file_system, "vfat" | "msdos") {
+        return Ok(());
+    }
+    ensure!(
+        size <= FAT32_LIMIT,
+        "the destination is a {file_system} volume, which cannot hold a file over \
+         {FAT32_LIMIT} bytes, and the output would be {size} bytes"
+    );
+    Ok(())
+}
+
 /// Refuse before writing anything, rather than failing forty gigabytes in.
 pub fn check_free_space(directory: &Path, needed: u64) -> Result<u64> {
     let available = free_space(directory)?;
@@ -706,6 +730,23 @@ a line this parser does not understand";
             output.rename_already_happened(),
             "the destination is there and the temporary name is gone"
         );
+    }
+
+    #[test]
+    fn an_output_too_large_for_a_fat32_destination_is_refused() {
+        let fat = Mount::classify("vfat");
+        let small = 3 * 1024 * 1024 * 1024;
+
+        check_file_size_limit(&fat, small).unwrap();
+        let error = check_file_size_limit(&fat, FAT32_LIMIT + 1)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("cannot hold a file over"), "{error}");
+
+        // Every other destination carries no such limit.
+        check_file_size_limit(&Mount::classify("ext4"), u64::MAX).unwrap();
+        check_file_size_limit(&Mount::classify("nfs4"), u64::MAX).unwrap();
+        check_file_size_limit(&Mount::Unknown, u64::MAX).unwrap();
     }
 
     #[test]

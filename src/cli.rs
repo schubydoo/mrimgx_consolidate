@@ -313,6 +313,7 @@ fn write_merge(
     let mut notes: Vec<String> = mount.caveats();
 
     // Refuse now rather than forty gigabytes in.
+    commit::check_file_size_limit(&mount, plan.projected_size())?;
     let free = commit::check_free_space(directory, plan.projected_size())?;
 
     let held = format!(
