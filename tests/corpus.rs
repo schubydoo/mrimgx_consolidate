@@ -1473,16 +1473,34 @@ fn the_compressed_and_the_encrypted_sets_merge_whole() {
     }
 }
 
-/// Bytes this process has read, from `/proc/self/io`.
-fn bytes_read() -> u64 {
-    std::fs::read_to_string("/proc/self/io")
-        .ok()
-        .and_then(|text| {
-            text.lines()
+/// Run the shipped scan command and report how many bytes it read.
+///
+/// The count comes from `/proc/<pid>/io` of the child, polled until it exits. It cannot come
+/// from this process: the counter is per process, and the test harness runs tests in threads
+/// of one process, so every other test's reads would land in it.
+fn scan_and_count_reads(directory: &Path) -> u64 {
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_mrimgx-consolidate"))
+        .arg("scan")
+        .arg(directory)
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+
+    let mut read = 0;
+    loop {
+        if let Ok(text) = std::fs::read_to_string(format!("/proc/{}/io", child.id())) {
+            if let Some(value) = text
+                .lines()
                 .find_map(|line| line.strip_prefix("rchar: "))
-                .and_then(|value| value.trim().parse().ok())
-        })
-        .unwrap_or(0)
+                .and_then(|value| value.trim().parse::<u64>().ok())
+            {
+                read = read.max(value);
+            }
+        }
+        if child.try_wait().unwrap().is_some() {
+            return read;
+        }
+    }
 }
 
 #[test]
@@ -1497,9 +1515,8 @@ fn a_scan_reports_what_a_merge_would_reclaim_and_reads_no_data_block() {
         return;
     }
 
-    let before = bytes_read();
+    let read = scan_and_count_reads(&source_dir);
     let found = scan::scan(&source_dir).unwrap();
-    let read = bytes_read() - before;
 
     assert_eq!(found.sets.len(), 1);
     let set = &found.sets[0];
@@ -1512,9 +1529,10 @@ fn a_scan_reports_what_a_merge_would_reclaim_and_reads_no_data_block() {
     assert!(set.candidates[0].reclaims >= set.candidates[1].reclaims);
     assert_eq!(set.candidates[0].kind, plan::MergeKind::SyntheticFull);
 
-    // The set is 3.7 GB. A scan that reads a hundredth of that read no data block.
+    // The set is 3.7 GB. A scan that reads a hundredth of that read no data block. The
+    // lower bound proves the instrument saw the reads at all.
     assert!(
-        read < set.bytes / 100,
+        read > 100_000 && read < set.bytes / 100,
         "the scan read {read} bytes of a {} byte set",
         set.bytes
     );
