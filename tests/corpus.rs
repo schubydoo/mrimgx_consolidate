@@ -859,6 +859,182 @@ fn patching_a_real_document_records_the_merge_and_leaks_no_path() {
     json::check_round_trip(&reparsed, &patched).unwrap();
 }
 
+#[test]
+fn the_written_output_reads_back_and_resolves_to_the_same_blocks() {
+    // The whole write path end to end, checked with this crate's own reader. It proves the
+    // output parses and resolves. It does not prove the image restores: only the extraction
+    // comparison against the independent reference extractor proves that.
+    let Some(dir) = corpus() else {
+        eprintln!("skipping: testdata/ is absent");
+        return;
+    };
+    let target = dir.join("Backup-Set/DD5A77E6B68A6C34-Full-01-01.mrimg");
+    if !target.exists() {
+        eprintln!("skipping: the two-file set is absent");
+        return;
+    }
+
+    let set = BackupSet::discover(&target).unwrap();
+    let plan = plan::build(&set, 0, 1).unwrap();
+    let before = set.flatten().unwrap();
+
+    let out_dir = tempfile::tempdir().unwrap();
+    let name = "DD5A77E6B68A6C34-Full-01-01.mrimg";
+    let out_path = out_dir.path().join(name);
+    let written = {
+        let mut source = write::SourceFiles::open(&set, &plan).unwrap();
+        let file = std::fs::File::create(&out_path).unwrap();
+        let mut out = std::io::BufWriter::new(file);
+        let written = write::write_output(&set, &plan, &mut source, &mut out, name).unwrap();
+        out.into_inner().unwrap().sync_all().unwrap();
+        written
+    };
+
+    assert_eq!(std::fs::metadata(&out_path).unwrap().len(), written.size);
+    assert!(
+        written.size <= plan.projected_size(),
+        "the plan projected {} bytes and the write produced {}",
+        plan.projected_size(),
+        written.size
+    );
+
+    write::check_output(&out_path, &plan).unwrap();
+
+    // The shipped command opens it, which is the check a user runs first.
+    let inspect = std::process::Command::new(env!("CARGO_BIN_EXE_mrimgx-consolidate"))
+        .arg("inspect")
+        .arg(&out_path)
+        .output()
+        .unwrap();
+    assert!(
+        inspect.status.success(),
+        "inspect refused the output: {}",
+        String::from_utf8_lossy(&inspect.stderr)
+    );
+
+    // The metadata walk lands on the footer, which is what `inspect` reports.
+    let output = BackupFile::open(&out_path, true).unwrap();
+    output.check_framing().unwrap();
+    assert_eq!(output.root_at, written.root_at);
+    assert_eq!(output.trailing_bytes(), block::FOOTER_LEN);
+    assert_eq!(output.header.index_file_position, written.data.end);
+    assert_eq!(output.header.merged_files, vec![0]);
+    assert!(
+        !output.header.delta_index,
+        "a synthetic Full is not a delta"
+    );
+
+    // The output claims both file numbers, so it is a complete set on its own.
+    let after_set = BackupSet::discover(&out_path).unwrap();
+    assert_eq!(after_set.members.len(), 1);
+    let after = after_set.flatten().unwrap();
+
+    assert_eq!(after.disks.len(), before.disks.len());
+    let mut compared = 0;
+    for (d, (new_disk, old_disk)) in after.disks.iter().zip(before.disks.iter()).enumerate() {
+        assert_eq!(new_disk.len(), old_disk.len(), "disk {d}");
+        for (p, (new_part, old_part)) in new_disk.iter().zip(old_disk.iter()).enumerate() {
+            assert_eq!(new_part.len(), old_part.len(), "disk {d} partition {p}");
+            for (i, (new, old)) in new_part.iter().zip(old_part.iter()).enumerate() {
+                let at = format!("disk {d} partition {p} block {i}");
+                assert_eq!(new.is_hole(), old.is_hole(), "{at}");
+                if new.is_hole() {
+                    continue;
+                }
+                assert_eq!(new.block_length, old.block_length, "{at}");
+                assert_eq!(new.md5_hash, old.md5_hash, "{at}");
+                assert_eq!(new.file_number, 1, "{at} belongs to the output");
+                compared += 1;
+            }
+        }
+    }
+    assert_eq!(compared, plan.blocks_to_copy());
+    assert_eq!(after.stored_bytes(), before.stored_bytes());
+}
+
+#[test]
+fn an_incremental_merge_keeps_the_full_and_still_resolves() {
+    // Files 1 through 3 of the four-file set merge into one Incremental. File 0 stays on
+    // disk, so the output keeps references to it and carries a delta index.
+    let Some(dir) = corpus() else {
+        eprintln!("skipping: testdata/ is absent");
+        return;
+    };
+    let source_dir = dir.join("Backup-Set-MP");
+    let full = source_dir.join("584221F3840B0DBE-MP-Full-00-00.mrimg");
+    let target = source_dir.join("584221F3840B0DBE-MP-Full-03-03.mrimg");
+    if !full.exists() || !target.exists() {
+        eprintln!("skipping: the multi-partition set is absent");
+        return;
+    }
+
+    let set = BackupSet::discover(&target).unwrap();
+    let plan = plan::build(&set, 1, 3).unwrap();
+    assert_eq!(plan.kind, plan::MergeKind::IncrementalMerge);
+    // The Full's blocks are not in this plan at all. A delta index names only the positions
+    // the absorbed members changed, and the Full still supplies the rest at resolve time.
+    assert_eq!(plan.blocks_to_copy(), 43 + 27 + 45);
+    let before = set.flatten().unwrap();
+
+    // The surviving Full has to sit beside the output, because a set is discovered by
+    // scanning one directory.
+    let out_dir = tempfile::tempdir().unwrap();
+    std::fs::copy(&full, out_dir.path().join(full.file_name().unwrap())).unwrap();
+    let name = "584221F3840B0DBE-MP-Full-03-03.mrimg";
+    let out_path = out_dir.path().join(name);
+    {
+        let mut source = write::SourceFiles::open(&set, &plan).unwrap();
+        let file = std::fs::File::create(&out_path).unwrap();
+        let mut out = std::io::BufWriter::new(file);
+        write::write_output(&set, &plan, &mut source, &mut out, name).unwrap();
+        out.into_inner().unwrap().sync_all().unwrap();
+    }
+
+    write::check_output(&out_path, &plan).unwrap();
+    let output = BackupFile::open(&out_path, true).unwrap();
+    assert!(
+        output.header.delta_index,
+        "an incremental merge stays delta"
+    );
+    assert_eq!(output.header.merged_files, vec![1, 2]);
+
+    let after = BackupSet::discover(&out_path).unwrap();
+    assert_eq!(
+        after.members.len(),
+        2,
+        "the Full and the merged Incremental"
+    );
+    let after = after.flatten().unwrap();
+
+    assert_eq!(after.disks.len(), before.disks.len());
+    for (d, (new_disk, old_disk)) in after.disks.iter().zip(before.disks.iter()).enumerate() {
+        for (p, (new_part, old_part)) in new_disk.iter().zip(old_disk.iter()).enumerate() {
+            assert_eq!(new_part.len(), old_part.len(), "disk {d} partition {p}");
+            for (i, (new, old)) in new_part.iter().zip(old_part.iter()).enumerate() {
+                let at = format!("disk {d} partition {p} block {i}");
+                assert_eq!(new.is_hole(), old.is_hole(), "{at}");
+                if new.is_hole() {
+                    continue;
+                }
+                assert_eq!(new.block_length, old.block_length, "{at}");
+                assert_eq!(new.md5_hash, old.md5_hash, "{at}");
+                // A block either moved into the output or still belongs to the Full.
+                assert!(
+                    new.file_number == 3 || new.file_number == 0,
+                    "{at} points at file {}",
+                    new.file_number
+                );
+            }
+        }
+    }
+    assert_eq!(after.stored_bytes(), before.stored_bytes());
+    // Both files still supply blocks, and the absorbed numbers are gone.
+    let per_file = after.blocks_per_file();
+    assert_eq!(per_file.len(), 2);
+    assert_eq!(per_file[&0], 561);
+    assert_eq!(per_file[&3], 43 + 27 + 45);
+}
+
 /// Copy the whole encrypted set and report throughput.
 ///
 /// Ignored by default: it moves about 3.8 GB and needs that much free space. Run it with

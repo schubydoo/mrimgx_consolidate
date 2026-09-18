@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{ensure, Context, Result};
 use serde_json::{Map, Value};
@@ -21,7 +21,7 @@ use crate::block::{self, align_up, MetadataBlockHeader};
 use crate::index::{Blocks, DataBlockIndexElement, DeltaDataBlock, PartitionIndex};
 use crate::json;
 use crate::plan::{Action, MergeKind, MergePlan, PartitionPlan};
-use crate::reader::Disk;
+use crate::reader::{BackupFile, Disk};
 use crate::set::BackupSet;
 
 /// Somewhere to read source blocks from.
@@ -555,6 +555,136 @@ fn object_mut<'a>(value: &'a mut Value, key: &str) -> Result<&'a mut Map<String,
 /// The file name with any directory removed, for both Windows and Unix separators.
 fn bare_name(path: &str) -> String {
     path.rsplit(['\\', '/']).next().unwrap_or(path).to_string()
+}
+
+/// A finished output file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Written {
+    pub data: DataRegion,
+    /// Offset of the root block list, which is what the footer records.
+    pub root_at: u64,
+    /// Size of the finished file.
+    pub size: u64,
+}
+
+/// Write a whole consolidated file: data region, metadata region, root list, footer.
+///
+/// `out` must start empty and receives the file from offset zero. `output_name` is the file
+/// name the output will carry, with no directory, and it is written into the document.
+///
+/// Nothing here opens the destination or renames anything. The caller owns the commit
+/// sequence, so this function can be tested against a buffer.
+pub fn write_output<W: Write, S: BlockSource>(
+    set: &BackupSet,
+    plan: &MergePlan,
+    source: &mut S,
+    out: &mut W,
+    output_name: &str,
+) -> Result<Written> {
+    let to = set
+        .owner(plan.to)
+        .with_context(|| format!("no member of the set owns file number {}", plan.to))?;
+
+    let data = write_data_region(plan, source, out, plan.out_file_number)?;
+    let root_at = write_metadata_region(&to.disks, &data, source, out, plan.to)?;
+
+    // The root list: the patched document, then `$AUXDATA` if the To file carries one.
+    let document = patch_document(set, plan, data.end, output_name)?;
+    let aux = to.root_list.find(block::AUXDATA);
+    // Stored plain. A compressed source document is decompressed on the way in, and the
+    // reference reader decompresses only when the flag says to.
+    let header = MetadataBlockHeader::for_payload(block::JSON, &document, aux.is_none())?;
+    out.write_all(&header.to_bytes())?;
+    out.write_all(&document)?;
+    let mut at = root_at + (block::HEADER_LEN + document.len()) as u64;
+
+    if let Some(aux) = aux {
+        // 32 bytes in every corpus file. This crate does not model what is in it, so the
+        // block is copied with its own header, flags and all. It ends the list.
+        let length = block::HEADER_LEN as u64 + u64::from(aux.header.block_length);
+        copy_range(source, out, plan.to, aux.offset, length)
+            .context("copying the $AUXDATA block")?;
+        at += length;
+    }
+
+    out.write_all(&block::footer_bytes(root_at))?;
+
+    Ok(Written {
+        data,
+        root_at,
+        size: at + block::FOOTER_LEN,
+    })
+}
+
+/// Read a finished output back and make sure that it is what the plan describes.
+///
+/// This runs before the output is renamed into place, so a framing mistake shows up now
+/// rather than in a restore months later. The read uses this crate's own reader, which
+/// proves the file parses but not that it is correct: only an extraction comparison against
+/// the independent reference extractor proves that.
+pub fn check_output(path: &Path, plan: &MergePlan) -> Result<()> {
+    let file = BackupFile::open(path, true)?;
+    file.check_framing()?;
+
+    ensure!(
+        file.header.file_number == plan.out_file_number,
+        "the output claims file number {} rather than {}",
+        file.header.file_number,
+        plan.out_file_number
+    );
+    ensure!(
+        file.header.delta_index == plan.kind.delta_index(),
+        "the output claims delta_index {} rather than {}",
+        file.header.delta_index,
+        plan.kind.delta_index()
+    );
+
+    let data_end = file.header.index_file_position;
+    for (d, disk) in file.disks.iter().enumerate() {
+        for (p, part) in disk.partitions.iter().enumerate() {
+            let check = |entry: &DataBlockIndexElement| -> Result<()> {
+                if entry.is_hole() {
+                    return Ok(());
+                }
+                ensure!(
+                    entry.file_number == plan.out_file_number
+                        || !plan.absorbed.contains(&entry.file_number),
+                    "disk {d} partition {p} still references file number {}, \
+                     which the merge absorbed",
+                    entry.file_number
+                );
+                if entry.file_number == plan.out_file_number {
+                    let start = u64::try_from(entry.file_position)
+                        .context("an index entry of the output has a negative position")?;
+                    let end = start + u64::from(entry.block_length);
+                    ensure!(
+                        end <= data_end,
+                        "disk {d} partition {p} has a block at {start} of {} bytes, \
+                         which runs past the data region at {data_end}",
+                        entry.block_length
+                    );
+                }
+                Ok(())
+            };
+
+            for entry in &part.index.reserved {
+                check(entry)?;
+            }
+            match &part.index.blocks {
+                Blocks::Full(entries) => {
+                    for entry in entries {
+                        check(entry)?;
+                    }
+                }
+                Blocks::Delta(entries) => {
+                    for delta in entries {
+                        check(&delta.element)?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
