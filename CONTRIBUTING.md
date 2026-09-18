@@ -15,8 +15,8 @@ Read `README.md` for what the tool does and where it stands.
 You need Rust 1.96 or later. Nothing else.
 
 ```sh
-git clone https://github.com/schubydoo/mrimgx-consolidate
-cd mrimgx-consolidate
+git clone https://github.com/schubydoo/mrimgx_consolidate
+cd mrimgx_consolidate
 cargo test
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
@@ -37,14 +37,14 @@ Not to save a recovery file beside it. The tool writes one new file and touches 
 **Nothing is deleted before the run read the output back.** A rename that returns success is
 not proof on a network mount.
 
-**The crate contains no `unsafe` code.** If a call needs it, find a safe wrapper, or leave
-the feature out.
+**The crate contains no `unsafe` code.** A call that needs it gets a safe wrapper, or the
+feature stays out.
 
 **A block is copied byte for byte.** Nothing is decompressed, re-encrypted or re-encoded on
 the way through. A change that makes the tool re-encode a block needs a very good reason.
 
-**A refusal beats a guess.** If the format says something this crate does not model, stop.
-Say so in words a person can act on.
+**A refusal beats a guess.** A real file sometimes says something this crate does not model.
+Stop there, and say so in words a person can act on.
 
 ## Tests
 
