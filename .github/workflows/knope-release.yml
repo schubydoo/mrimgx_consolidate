@@ -21,6 +21,8 @@ name: Knope Release
 #     --certificate-oidc-issuer https://token.actions.githubusercontent.com
 
 on:
+  push:
+    branches: [feat/release-pipeline] # TEMPORARY rehearsal, reverted before merge
   pull_request:
     types: [closed]
     branches: [main]
@@ -53,7 +55,8 @@ jobs:
            && github.event.pull_request.merged == true
            && github.head_ref == 'release')
           || (github.event_name == 'workflow_dispatch'
-              && (github.ref == 'refs/heads/main' || !inputs.publish)) }}
+              && (github.ref == 'refs/heads/main' || !inputs.publish))
+          || github.event_name == 'push' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -138,7 +141,8 @@ jobs:
            && github.event.pull_request.merged == true
            && github.head_ref == 'release')
           || (github.event_name == 'workflow_dispatch'
-              && (github.ref == 'refs/heads/main' || !inputs.publish)) }}
+              && (github.ref == 'refs/heads/main' || !inputs.publish))
+          || github.event_name == 'push' }}
     runs-on: macos-latest
     timeout-minutes: 30
     permissions:
@@ -198,7 +202,8 @@ jobs:
            && github.event.pull_request.merged == true
            && github.head_ref == 'release')
           || (github.event_name == 'workflow_dispatch'
-              && (github.ref == 'refs/heads/main' || !inputs.publish)) }}
+              && (github.ref == 'refs/heads/main' || !inputs.publish))
+          || github.event_name == 'push' }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
@@ -327,7 +332,7 @@ jobs:
           echo "staged $(find dist/release-assets -type f | wc -l) assets"
       # A rehearsal ends here, with the staged set kept for inspection.
       - name: Upload the staged set (rehearsal)
-        if: ${{ github.event_name == 'workflow_dispatch' && !inputs.publish }}
+        if: ${{ (github.event_name == 'workflow_dispatch' && !inputs.publish) || github.event_name == 'push' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-assets
