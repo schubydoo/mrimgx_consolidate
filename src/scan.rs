@@ -97,6 +97,69 @@ pub fn members_above(directory: &Path, imageid: &str, increment: u16) -> Vec<Pat
     found
 }
 
+/// What a scan of one folder of a tree found.
+#[derive(Debug, Clone)]
+pub struct Folder {
+    pub directory: PathBuf,
+    pub found: Scan,
+}
+
+/// Folders a recursive scan does not enter. Each is a storage system's read-only view of
+/// earlier snapshots of the folders around it, so entering one would report every set again
+/// once per snapshot: `.zfs` on ZFS, `.snapshot` on NetApp and others, `#snapshot` on
+/// Synology.
+const SNAPSHOT_FOLDERS: &[&str] = &[".zfs", ".snapshot", "#snapshot"];
+
+/// Scan `root` and every folder below it, in path order.
+///
+/// A backup set always lives in one folder, so this is the one-folder scan run on each.
+/// Symbolic links to folders are not followed, so a link loop cannot trap the walk and a
+/// link cannot lead out of the tree. A folder below the root that cannot be listed is
+/// reported as skipped, and the walk carries on.
+pub fn scan_tree(root: &Path) -> Result<Vec<Folder>> {
+    let mut out = vec![Folder {
+        directory: root.to_path_buf(),
+        found: scan(root)?,
+    }];
+    let mut pending = subfolders(root);
+
+    while let Some(directory) = pending.pop() {
+        let found = match scan(&directory) {
+            Ok(found) => found,
+            Err(error) => Scan {
+                skipped: vec![Skipped {
+                    path: directory.clone(),
+                    reason: format!("{error:#}"),
+                }],
+                ..Scan::default()
+            },
+        };
+        pending.extend(subfolders(&directory));
+        out.push(Folder { directory, found });
+    }
+
+    out.sort_by(|a, b| a.directory.cmp(&b.directory));
+    Ok(out)
+}
+
+/// The real folders directly inside `directory`, leaving out links and snapshot folders.
+fn subfolders(directory: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        // file_type does not follow a symbolic link, so a link to a folder reads as a link.
+        .filter(|entry| entry.file_type().is_ok_and(|t| t.is_dir()))
+        .filter(|entry| {
+            !SNAPSHOT_FOLDERS
+                .iter()
+                .any(|name| entry.file_name() == std::ffi::OsStr::new(name))
+        })
+        .map(|entry| entry.path())
+        .collect()
+}
+
 /// Report every backup set in `directory`.
 pub fn scan(directory: &Path) -> Result<Scan> {
     let mut newest: BTreeMap<String, BackupFile> = BTreeMap::new();

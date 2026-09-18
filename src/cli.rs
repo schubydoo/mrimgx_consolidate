@@ -67,6 +67,10 @@ pub enum Command {
         /// The directory to look in.
         #[arg(value_name = "DIRECTORY")]
         directory: PathBuf,
+        /// Also scan every folder below it. Links to folders and snapshot folders such as
+        /// `.zfs` are not entered.
+        #[arg(long, short)]
+        recursive: bool,
         /// Report as JSON, so a scheduled job can act on it.
         #[arg(long)]
         json: bool,
@@ -85,7 +89,11 @@ pub enum Command {
 pub fn run() -> Result<()> {
     match Cli::parse().command {
         Command::Inspect { files } => inspect(&files),
-        Command::Scan { directory, json } => scan(&directory, json),
+        Command::Scan {
+            directory,
+            recursive,
+            json,
+        } => scan(&directory, recursive, json),
         Command::Resolve { file, blocks } => resolve(&file, blocks),
         Command::Consolidate {
             from,
@@ -199,44 +207,96 @@ fn plan_as_json(set: &BackupSet, plan: &plan::MergePlan) -> serde_json::Value {
     })
 }
 
-/// Report every backup set in a directory and what merging it would save.
-fn scan(directory: &Path, json: bool) -> Result<()> {
-    let found = scanner::scan(directory)?;
+/// Report every backup set in a directory, or in a whole tree, and what merging it would save.
+fn scan(directory: &Path, recursive: bool, json: bool) -> Result<()> {
+    if !recursive {
+        let found = scanner::scan(directory)?;
+        if json {
+            let mut document = scan_as_json(&found);
+            document["directory"] = directory.display().to_string().into();
+            println!("{}", serde_json::to_string_pretty(&document)?);
+        } else {
+            if found.sets.is_empty() {
+                println!("no backup set in {}", directory.display());
+            }
+            print_scan(&found);
+        }
+        return Ok(());
+    }
 
+    let folders = scanner::scan_tree(directory)?;
     if json {
         let document = serde_json::json!({
             "directory": directory.display().to_string(),
-            "sets": found.sets.iter().map(|set| serde_json::json!({
-                "imageid": set.imageid,
-                "newest": set.newest.display().to_string(),
-                "members": set.members,
-                "bytes": set.bytes,
-                "problem": set.problem,
-                "candidates": set.candidates.iter().map(|c| serde_json::json!({
-                    "from": c.from,
-                    "to": c.to,
-                    "kind": c.kind.consolidation_type(),
-                    "moves": c.moves,
-                    "reclaims": c.reclaims,
-                })).collect::<Vec<_>>(),
-                "refused": set.refused.iter().map(|r| serde_json::json!({
-                    "from": r.from,
-                    "to": r.to,
-                    "reason": r.reason,
-                })).collect::<Vec<_>>(),
-            })).collect::<Vec<_>>(),
-            "skipped": found.skipped.iter().map(|s| serde_json::json!({
-                "path": s.path.display().to_string(),
-                "reason": s.reason,
-            })).collect::<Vec<_>>(),
+            "recursive": true,
+            "folders": folders.iter().map(|folder| {
+                let mut entry = scan_as_json(&folder.found);
+                entry["directory"] = folder.directory.display().to_string().into();
+                entry
+            }).collect::<Vec<_>>(),
         });
         println!("{}", serde_json::to_string_pretty(&document)?);
         return Ok(());
     }
 
-    if found.sets.is_empty() {
-        println!("no backup set in {}", directory.display());
+    // A folder with nothing in it says nothing, so a tree of hundreds of folders prints only
+    // the ones that matter.
+    let mut sets = 0;
+    let mut mergeable = 0;
+    let mut reclaimable = 0u64;
+    for folder in &folders {
+        if folder.found.sets.is_empty() && folder.found.skipped.is_empty() {
+            continue;
+        }
+        println!("== {}", folder.directory.display());
+        print_scan(&folder.found);
+        sets += folder.found.sets.len();
+        for set in &folder.found.sets {
+            if let Some(best) = set.candidates.first().filter(|c| c.reclaims > 0) {
+                mergeable += 1;
+                reclaimable += best.reclaims;
+            }
+        }
     }
+    println!(
+        "{} folders scanned, {sets} backup sets, {mergeable} can be merged, \
+         reclaiming up to {reclaimable} bytes",
+        folders.len()
+    );
+    Ok(())
+}
+
+/// One folder's scan as a document, without the folder's name.
+fn scan_as_json(found: &scanner::Scan) -> serde_json::Value {
+    serde_json::json!({
+        "sets": found.sets.iter().map(|set| serde_json::json!({
+            "imageid": set.imageid,
+            "newest": set.newest.display().to_string(),
+            "members": set.members,
+            "bytes": set.bytes,
+            "problem": set.problem,
+            "candidates": set.candidates.iter().map(|c| serde_json::json!({
+                "from": c.from,
+                "to": c.to,
+                "kind": c.kind.consolidation_type(),
+                "moves": c.moves,
+                "reclaims": c.reclaims,
+            })).collect::<Vec<_>>(),
+            "refused": set.refused.iter().map(|r| serde_json::json!({
+                "from": r.from,
+                "to": r.to,
+                "reason": r.reason,
+            })).collect::<Vec<_>>(),
+        })).collect::<Vec<_>>(),
+        "skipped": found.skipped.iter().map(|s| serde_json::json!({
+            "path": s.path.display().to_string(),
+            "reason": s.reason,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+/// One folder's scan as text.
+fn print_scan(found: &scanner::Scan) {
     for set in &found.sets {
         if let Some(problem) = &set.problem {
             println!(
@@ -282,7 +342,6 @@ fn scan(directory: &Path, json: bool) -> Result<()> {
     for skipped in &found.skipped {
         println!("skipped {}: {}", skipped.path.display(), skipped.reason);
     }
-    Ok(())
 }
 
 /// Write the merge, commit it, and read it back.
