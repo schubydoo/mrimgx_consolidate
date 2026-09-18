@@ -1035,6 +1035,90 @@ fn an_incremental_merge_keeps_the_full_and_still_resolves() {
     assert_eq!(per_file[&3], 43 + 27 + 45);
 }
 
+/// The independent reference extractor, built by `scratch/build-refextract.sh`.
+fn refextract() -> Option<PathBuf> {
+    let path = PathBuf::from(std::env::var("REFEXTRACT").unwrap_or("/tmp/refextract".into()));
+    path.is_file().then_some(path)
+}
+
+fn extract(oracle: &Path, backup: &Path, image: &Path) {
+    let run = std::process::Command::new(oracle)
+        .arg(backup)
+        .arg(image)
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "{} refused {}: {}",
+        oracle.display(),
+        backup.display(),
+        String::from_utf8_lossy(&run.stderr)
+    );
+}
+
+#[test]
+fn the_merge_extracts_to_the_same_image_as_the_chain() {
+    // The gold standard. A second implementation, by different authors, restores the
+    // original chain and the merged file. Validating our writer with our own reader proves
+    // nothing, so this is the test that decides whether the merge is correct.
+    let Some(dir) = corpus() else {
+        eprintln!("skipping: testdata/ is absent");
+        return;
+    };
+    let Some(oracle) = refextract() else {
+        eprintln!("skipping: build the oracle with scratch/build-refextract.sh");
+        return;
+    };
+    let target = dir.join("Backup-Set/DD5A77E6B68A6C34-Full-01-01.mrimg");
+    if !target.exists() {
+        eprintln!("skipping: the two-file set is absent");
+        return;
+    }
+
+    let work = tempfile::tempdir().unwrap();
+    let from_chain = work.path().join("chain.img");
+    extract(&oracle, &target, &from_chain);
+
+    let set = BackupSet::discover(&target).unwrap();
+    let plan = plan::build(&set, 0, 1).unwrap();
+    let name = "DD5A77E6B68A6C34-Full-01-01.mrimg";
+    let merged = work.path().join(name);
+    {
+        let mut source = write::SourceFiles::open(&set, &plan).unwrap();
+        let file = std::fs::File::create(&merged).unwrap();
+        let mut out = std::io::BufWriter::new(file);
+        write::write_output(&set, &plan, &mut source, &mut out, name).unwrap();
+        out.into_inner().unwrap().sync_all().unwrap();
+    }
+
+    let from_merge = work.path().join("merge.img");
+    extract(&oracle, &merged, &from_merge);
+
+    // The two images are deliberately not the same length, and the numbers are pinned here
+    // so that the disk_size trap cannot be mistaken for a difference in content.
+    //
+    // The extractor creates the image at disk_size of the file it was given, then writes
+    // blocks, which extends the file when a block ends past that size. The chain ends at
+    // file 1, an Incremental, whose disk_size is the CHS product of 534643200. Its last
+    // block ends at 534773760, so the image stops there. The merge is a synthetic Full and
+    // takes the true device size of 536870912 from the Full, which is past every block, so
+    // the image is exactly that long. The extra 2097152 bytes lie beyond the partition.
+    let chain_bytes = std::fs::read(&from_chain).unwrap();
+    let merge_bytes = std::fs::read(&from_merge).unwrap();
+    assert_eq!(chain_bytes.len(), 534_773_760);
+    assert_eq!(merge_bytes.len(), 536_870_912);
+
+    assert_eq!(
+        chain_bytes,
+        merge_bytes[..chain_bytes.len()],
+        "the merged image differs from the chain image"
+    );
+    assert!(
+        merge_bytes[chain_bytes.len()..].iter().all(|b| *b == 0),
+        "the tail past the end of the chain image is not empty"
+    );
+}
+
 /// Copy the whole encrypted set and report throughput.
 ///
 /// Ignored by default: it moves about 3.8 GB and needs that much free space. Run it with
