@@ -16,6 +16,7 @@
 //! cp -r contrib/extract-to-img/Backup-Files/* <repo>/testdata/
 //! ```
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use mrimgx_consolidate::block;
@@ -1300,6 +1301,174 @@ fn compare_images(chain: &Path, merged: &Path) {
             && merge_bytes[common..].iter().all(|b| *b == 0),
         "the tail past the end of the shorter image is not empty"
     );
+}
+
+#[test]
+fn every_pair_of_the_multi_partition_set_merges_and_extracts() {
+    // Six From and To pairs across a four-file, three-partition chain. Each merged file is
+    // extracted by the oracle and compared against an extraction of the chain at the same
+    // resolution point.
+    //
+    // The merged file is extracted directly rather than through a later member. The oracle
+    // finds members by following file_history, and a later member's history still names the
+    // files the merge absorbed. The merged file's own history names the merged file for
+    // every number it absorbed, so the walk resolves. Our own reader finds members by
+    // scanning the directory, as the reference reader does, and does not have this limit.
+    let Some(dir) = corpus() else {
+        eprintln!("skipping: testdata/ is absent");
+        return;
+    };
+    let Some(oracle) = refextract() else {
+        eprintln!("skipping: build the oracle with scratch/build-refextract.sh");
+        return;
+    };
+    let source_dir = dir.join("Backup-Set-MP");
+    let name = |n: u16| format!("584221F3840B0DBE-MP-Full-{n:02}-{n:02}.mrimg");
+    if !source_dir.join(name(3)).exists() {
+        eprintln!("skipping: the multi-partition set is absent");
+        return;
+    }
+
+    let work = tempfile::tempdir().unwrap();
+    let mut baselines: HashMap<u16, PathBuf> = HashMap::new();
+
+    for (from, to) in [(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)] {
+        let case = work.path().join(format!("merge-{from}-{to}"));
+        std::fs::create_dir(&case).unwrap();
+        let merged = case.join(format!("MERGED-{from:02}-{to:02}.mrimg"));
+        merge(
+            &source_dir.join(name(from)),
+            &source_dir.join(name(to)),
+            &merged,
+        );
+
+        let output = BackupFile::open(&merged, true).unwrap();
+        output.check_framing().unwrap();
+        assert_eq!(output.header.file_number, to);
+        assert_eq!(
+            output.header.merged_files,
+            (from..to).map(i64::from).collect::<Vec<_>>(),
+            "the output claims every number it absorbed"
+        );
+        // A merge that starts at the Full stands alone and carries a complete index. One
+        // that starts at an Incremental still references the files below it.
+        assert_eq!(
+            output.header.delta_index,
+            from != 0,
+            "disagreement on the index form for {from} through {to}"
+        );
+
+        // The oracle needs the members the merge did not absorb beside the output.
+        for number in 0..from {
+            std::fs::copy(source_dir.join(name(number)), case.join(name(number))).unwrap();
+        }
+
+        let baseline = baselines.entry(to).or_insert_with(|| {
+            let image = work.path().join(format!("chain-as-of-{to}.img"));
+            extract(&oracle, &source_dir.join(name(to)), &image);
+            image
+        });
+        let from_merge = case.join("merge.img");
+        extract(&oracle, &merged, &from_merge);
+
+        compare_images(baseline, &from_merge);
+    }
+}
+
+#[test]
+fn the_compressed_and_the_encrypted_sets_merge_whole() {
+    // The sample corpus is uncompressed and unencrypted. These two sets are not, and a
+    // merge must copy their stored bytes without decompressing or decrypting anything. The
+    // encrypted set is merged with no password, because consolidation never needs one.
+    //
+    // Only the two increments of each set are merged. Merging from the Full would copy
+    // 3.7 GB, which is what the ignored throughput test is for.
+    let Some(dir) = corpus() else {
+        eprintln!("skipping: testdata/ is absent");
+        return;
+    };
+
+    for (label, target) in [
+        (
+            "high compression",
+            "NOPASS/B5D6313DA329C717-NOPASS-02-02.mrimgx",
+        ),
+        ("AES-128", "PASS/E9A7F5B2D6166D7C-NOPASS-02-02.mrimgx"),
+    ] {
+        let target = dir.join(target);
+        if !target.exists() {
+            eprintln!("skipping: the {label} set is absent");
+            continue;
+        }
+
+        let set = BackupSet::discover(&target).unwrap();
+        let plan = plan::build(&set, 1, 2).unwrap();
+        assert_eq!(plan.kind, plan::MergeKind::IncrementalMerge);
+        assert!(plan.blocks_to_copy() > 0, "{label}: there is work to do");
+
+        let out_dir = tempfile::tempdir().unwrap();
+        let merged = out_dir.path().join("MERGED-02-02.mrimgx");
+        let from = set.owner(1).unwrap().path.clone();
+        merge(&from, &target, &merged);
+
+        let output = BackupFile::open(&merged, true).unwrap();
+        output.check_framing().unwrap();
+        write::check_output(&merged, &plan).unwrap();
+        assert_eq!(output.header.merged_files, vec![1], "{label}");
+
+        // The settings are carried through, because the blocks were not re-encoded.
+        let to = set.owner(2).unwrap();
+        assert_eq!(
+            output.json["_compression"], to.json["_compression"],
+            "{label}"
+        );
+        assert_eq!(
+            output.json["_encryption"], to.json["_encryption"],
+            "{label}"
+        );
+
+        // Every copied block matches the bytes it came from, byte for byte.
+        let mut compared = 0;
+        for (part, written) in plan
+            .partitions
+            .iter()
+            .zip(output.disks[0].partitions.iter())
+        {
+            let Blocks::Delta(deltas) = &written.index.blocks else {
+                panic!("{label}: an incremental merge carries a delta index");
+            };
+            let pairs = part
+                .blocks
+                .iter()
+                .zip(deltas.iter().map(|delta| &delta.element))
+                // The reserved sectors hold the file allocation tables. They are large,
+                // they are compressed, and every file re-stores them in full, so on the
+                // high-compression set they are most of what moves.
+                .chain(part.reserved.iter().zip(written.index.reserved.iter()));
+            for (action, entry) in pairs {
+                let plan::Action::Copy(original) = action else {
+                    continue;
+                };
+                let owner = set.owner(original.file_number).unwrap();
+                assert_eq!(
+                    read_range(&merged, entry.file_position as u64, entry.block_length),
+                    read_range(
+                        &owner.path,
+                        original.file_position as u64,
+                        original.block_length
+                    ),
+                    "{label}: a copied block differs from its source"
+                );
+                compared += 1;
+            }
+        }
+        assert_eq!(
+            compared,
+            plan.blocks_to_copy(),
+            "{label}: every copied block is compared against its source"
+        );
+        eprintln!("{label}: {compared} copied blocks compared against their sources");
+    }
 }
 
 #[test]
