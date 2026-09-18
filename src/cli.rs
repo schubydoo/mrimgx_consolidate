@@ -11,6 +11,7 @@ use crate::index::Blocks;
 use crate::json;
 use crate::plan::{self, MergeKind};
 use crate::reader::BackupFile;
+use crate::scan as scanner;
 use crate::set::BackupSet;
 use crate::verify;
 use crate::write;
@@ -58,6 +59,12 @@ pub enum Command {
         #[arg(long)]
         delete_merged: bool,
     },
+    /// Report which backup sets in a directory can be consolidated, and what that saves.
+    Scan {
+        /// The directory to look in.
+        #[arg(value_name = "DIRECTORY")]
+        directory: PathBuf,
+    },
     /// Resolve a backup set and report where every logical block lives.
     Resolve {
         /// Any file of the set. The set is resolved as of this file.
@@ -72,6 +79,7 @@ pub enum Command {
 pub fn run() -> Result<()> {
     match Cli::parse().command {
         Command::Inspect { files } => inspect(&files),
+        Command::Scan { directory } => scan(&directory),
         Command::Resolve { file, blocks } => resolve(&file, blocks),
         Command::Consolidate {
             from,
@@ -141,6 +149,55 @@ fn consolidate(
     let out = out
         .context("give --out FILE to write the merge, or --dry-run to report what it would move")?;
     write_merge(&set, &plan, out, verify_md5, delete_merged)
+}
+
+/// Report every backup set in a directory and what merging it would save.
+fn scan(directory: &Path) -> Result<()> {
+    let found = scanner::scan(directory)?;
+
+    if found.sets.is_empty() {
+        println!("no backup set in {}", directory.display());
+    }
+    for set in &found.sets {
+        if let Some(problem) = &set.problem {
+            println!(
+                "set {}  {} files, {} bytes: {problem}",
+                set.imageid, set.members, set.bytes
+            );
+            continue;
+        }
+        let best = &set.candidates[0];
+        if best.reclaims == 0 {
+            println!(
+                "set {}  {} files, {} bytes: nothing to gain from a merge",
+                set.imageid, set.members, set.bytes
+            );
+            continue;
+        }
+
+        println!(
+            "set {}  {} files, {} bytes, newest {}",
+            set.imageid,
+            set.members,
+            set.bytes,
+            set.newest.display()
+        );
+        for candidate in &set.candidates {
+            let kind = match candidate.kind {
+                MergeKind::SyntheticFull => "synthetic full",
+                MergeKind::IncrementalMerge => "incremental merge",
+            };
+            println!(
+                "    files {} through {}  {kind:<18} moves {} bytes, reclaims {} bytes",
+                candidate.from, candidate.to, candidate.moves, candidate.reclaims
+            );
+        }
+    }
+
+    for skipped in &found.skipped {
+        println!("skipped {}: {}", skipped.path.display(), skipped.reason);
+    }
+    Ok(())
 }
 
 /// Write the merge, commit it, and read it back.

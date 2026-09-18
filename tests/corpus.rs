@@ -24,6 +24,7 @@ use mrimgx_consolidate::index::Blocks;
 use mrimgx_consolidate::json;
 use mrimgx_consolidate::plan;
 use mrimgx_consolidate::reader::BackupFile;
+use mrimgx_consolidate::scan;
 use mrimgx_consolidate::set::BackupSet;
 use mrimgx_consolidate::verify;
 use mrimgx_consolidate::write;
@@ -1470,6 +1471,86 @@ fn the_compressed_and_the_encrypted_sets_merge_whole() {
         );
         eprintln!("{label}: {compared} copied blocks compared against their sources");
     }
+}
+
+/// Bytes this process has read, from `/proc/self/io`.
+fn bytes_read() -> u64 {
+    std::fs::read_to_string("/proc/self/io")
+        .ok()
+        .and_then(|text| {
+            text.lines()
+                .find_map(|line| line.strip_prefix("rchar: "))
+                .and_then(|value| value.trim().parse().ok())
+        })
+        .unwrap_or(0)
+}
+
+#[test]
+fn a_scan_reports_what_a_merge_would_reclaim_and_reads_no_data_block() {
+    let Some(dir) = corpus() else {
+        eprintln!("skipping: testdata/ is absent");
+        return;
+    };
+    let source_dir = dir.join("NOPASS");
+    if !source_dir.is_dir() {
+        eprintln!("skipping: the compressed set is absent");
+        return;
+    }
+
+    let before = bytes_read();
+    let found = scan::scan(&source_dir).unwrap();
+    let read = bytes_read() - before;
+
+    assert_eq!(found.sets.len(), 1);
+    let set = &found.sets[0];
+    assert_eq!(set.members, 3);
+    assert!(set.bytes > 3_000_000_000, "{} bytes", set.bytes);
+    assert_eq!(set.problem, None);
+    // One candidate per starting file: 0, 1 and 2 of a set whose newest file is 2.
+    assert_eq!(set.candidates.len(), 2);
+    assert_eq!(set.candidates[0].to, 2);
+    assert!(set.candidates[0].reclaims >= set.candidates[1].reclaims);
+    assert_eq!(set.candidates[0].kind, plan::MergeKind::SyntheticFull);
+
+    // The set is 3.7 GB. A scan that reads a hundredth of that read no data block.
+    assert!(
+        read < set.bytes / 100,
+        "the scan read {read} bytes of a {} byte set",
+        set.bytes
+    );
+}
+
+#[test]
+fn a_file_that_does_not_parse_is_listed_and_the_scan_carries_on() {
+    let Some(dir) = corpus() else {
+        eprintln!("skipping: testdata/ is absent");
+        return;
+    };
+    let real = dir.join("3DFB059161047C13-RealFAT32-00-00.mrimg");
+    if !real.exists() {
+        eprintln!("skipping: the single-file set is absent");
+        return;
+    }
+
+    let work = tempfile::tempdir().unwrap();
+    std::fs::copy(&real, work.path().join(real.file_name().unwrap())).unwrap();
+    std::fs::write(work.path().join("nonsense.mrimgx"), b"not a backup file").unwrap();
+    std::fs::write(work.path().join("notes.txt"), b"ignored").unwrap();
+
+    let found = scan::scan(work.path()).unwrap();
+
+    assert_eq!(found.sets.len(), 1, "the readable set is still reported");
+    assert_eq!(
+        found.skipped.len(),
+        1,
+        "and only the broken file is skipped"
+    );
+    assert!(found.skipped[0].path.ends_with("nonsense.mrimgx"));
+    assert!(
+        found.skipped[0].reason.contains("too short to hold"),
+        "{}",
+        found.skipped[0].reason
+    );
 }
 
 #[test]
