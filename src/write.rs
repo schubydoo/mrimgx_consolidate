@@ -429,11 +429,15 @@ fn patch_header(doc: &mut Value, plan: &MergePlan, index_file_position: u64) -> 
     Ok(())
 }
 
-/// Rewrite the per-partition file history so that it names files rather than paths.
+/// Rewrite the per-partition file history so that it names the files that still exist.
 ///
-/// An absorbed number now lives in the output, so its entry names the output. Any other
-/// entry keeps its own file name with the directory removed. The name is a locator hint:
-/// the reference reader resolves it against the directory it was given.
+/// One entry per file. Every absorbed number is dropped and one entry for the output takes
+/// their place, because those files are gone and the output holds their blocks. An entry for
+/// a file that survives keeps its own name, with the directory removed.
+///
+/// Two entries must never carry one name. Macrium Reflect X binds the file it opens to the
+/// first entry that names it, then reports every later entry with that name as a missing
+/// file, and refuses to verify. Measured in Reflect X 10.0.8843 on 2026-09-18.
 fn patch_partitions(doc: &mut Value, plan: &MergePlan, output_name: &str) -> Result<()> {
     let disks = doc
         .get_mut("disks")
@@ -454,20 +458,35 @@ fn patch_partitions(doc: &mut Value, plan: &MergePlan, output_name: &str) -> Res
                 else {
                     continue;
                 };
-                for entry in history.iter_mut() {
+                // The files the merge absorbed are gone, so their entries go with them.
+                history.retain(|entry| {
                     let number = entry
                         .get("file_number")
                         .and_then(Value::as_u64)
                         .and_then(|n| u16::try_from(n).ok());
+                    match number {
+                        Some(n) => !plan.absorbed.contains(&n),
+                        None => false,
+                    }
+                });
+                for entry in history.iter_mut() {
                     let recorded = entry.get("file_name").and_then(Value::as_str).unwrap_or("");
-                    let name = match number {
-                        Some(n) if plan.absorbed.contains(&n) => output_name.to_string(),
-                        _ => bare_name(recorded),
-                    };
+                    let name = bare_name(recorded);
                     if let Some(entry) = entry.as_object_mut() {
                         entry.insert("file_name".into(), name.into());
                     }
                 }
+                // One entry for the output, in the place the numbers put it.
+                history.push(serde_json::json!({
+                    "file_name": output_name,
+                    "file_number": plan.out_file_number,
+                }));
+                history.sort_by_key(|entry| {
+                    entry
+                        .get("file_number")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0)
+                });
                 history.len()
             };
             header.insert("file_history_count".into(), count.into());
@@ -1195,7 +1214,7 @@ mod tests {
     }
 
     #[test]
-    fn the_file_history_names_files_and_carries_no_path() {
+    fn the_file_history_names_one_file_each_and_carries_no_path() {
         let plan = plan_with(MergeKind::SyntheticFull, Vec::new(), Vec::new());
         let mut doc = document();
 
@@ -1203,12 +1222,25 @@ mod tests {
 
         let header = &doc["disks"][0]["partitions"][0]["_header"];
         let history = header["file_history"].as_array().unwrap();
-        // Files 0 and 1 are absorbed, so their bytes live in the output. File 7 is not, so
-        // it keeps its own name with the directory removed.
+        // Files 0 and 1 were absorbed, so those two entries become one entry for the output.
+        // File 7 survives, so it keeps its own name with the directory removed.
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0]["file_number"], 1);
         assert_eq!(history[0]["file_name"], "SET-01-01.mrimgx");
-        assert_eq!(history[1]["file_name"], "SET-01-01.mrimgx");
-        assert_eq!(history[2]["file_name"], "SET-07-07.mrimgx");
-        assert_eq!(header["file_history_count"], 3);
+        assert_eq!(history[1]["file_number"], 7);
+        assert_eq!(history[1]["file_name"], "SET-07-07.mrimgx");
+        assert_eq!(header["file_history_count"], 2);
+
+        // No two entries name one file. Reflect X binds the file it opens to the first entry
+        // that names it and calls every later entry with that name missing.
+        let names: Vec<&str> = history
+            .iter()
+            .map(|entry| entry["file_name"].as_str().unwrap())
+            .collect();
+        let mut unique = names.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(names.len(), unique.len(), "{names:?}");
     }
 
     #[test]

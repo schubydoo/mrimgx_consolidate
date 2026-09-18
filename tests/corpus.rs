@@ -849,6 +849,19 @@ fn patching_a_real_document_records_the_merge_and_leaks_no_path() {
         "this set is the one that proves disk_size differs across a chain"
     );
 
+    // One entry per file that still exists, and no two entries naming one file. Reflect X
+    // binds the file it opens to the first entry that names it, then calls every later entry
+    // with that name a missing file and refuses to verify.
+    for disk in doc["disks"].as_array().unwrap() {
+        for part in disk["partitions"].as_array().unwrap() {
+            let history = part["_header"]["file_history"].as_array().unwrap();
+            assert_eq!(history.len(), 1, "the output absorbed the whole set");
+            assert_eq!(history[0]["file_number"], 1);
+            assert_eq!(history[0]["file_name"], "MERGED-00-00.mrimg");
+            assert_eq!(part["_header"]["file_history_count"], 1);
+        }
+    }
+
     let mut leaks = Vec::new();
     drive_letter_paths(&doc, String::new(), &mut leaks);
     assert!(leaks.is_empty(), "paths survived the patch: {leaks:?}");
