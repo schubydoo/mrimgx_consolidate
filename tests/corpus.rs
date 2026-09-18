@@ -1605,6 +1605,115 @@ fn a_file_that_does_not_parse_is_listed_and_the_scan_carries_on() {
     );
 }
 
+/// A tree with the two-file sample set in `a/b` and in `plain`, a copy under `.zfs` that
+/// stands for a snapshot, and a link from `a/loop` back to the root.
+fn sample_tree() -> Option<tempfile::TempDir> {
+    let dir = corpus()?;
+    let source = dir.join("Backup-Set");
+    let names = [
+        "DD5A77E6B68A6C34-Full-00-00.mrimg",
+        "DD5A77E6B68A6C34-Full-01-01.mrimg",
+    ];
+    if !source.join(names[1]).exists() {
+        return None;
+    }
+    let work = tempfile::tempdir().unwrap();
+    for folder in ["a/b", "plain", ".zfs/snapshot/daily"] {
+        let target = work.path().join(folder);
+        std::fs::create_dir_all(&target).unwrap();
+        for name in names {
+            std::fs::copy(source.join(name), target.join(name)).unwrap();
+        }
+    }
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(work.path(), work.path().join("a/loop")).unwrap();
+    Some(work)
+}
+
+#[test]
+fn a_recursive_scan_finds_nested_sets_and_leaves_snapshots_and_links_alone() {
+    let Some(work) = sample_tree() else {
+        eprintln!("skipping: the sample set is absent");
+        return;
+    };
+
+    let folders = scan::scan_tree(work.path()).unwrap();
+    let with_sets: Vec<&Path> = folders
+        .iter()
+        .filter(|f| !f.found.sets.is_empty())
+        .map(|f| f.directory.as_path())
+        .collect();
+
+    // Both ordinary copies are found. That proves the walk sees a set wherever it sits,
+    // so the absence of the .zfs copy below is the skip at work and not a blind spot.
+    assert_eq!(
+        with_sets,
+        vec![
+            work.path().join("a/b").as_path(),
+            work.path().join("plain").as_path()
+        ]
+    );
+    for folder in &folders {
+        assert!(
+            !folder.directory.starts_with(work.path().join(".zfs")),
+            "entered {}",
+            folder.directory.display()
+        );
+        assert!(
+            !folder.directory.ends_with("loop"),
+            "followed the link to {}",
+            folder.directory.display()
+        );
+    }
+    // The root, a, a/b and plain. Nothing else.
+    assert_eq!(folders.len(), 4, "{folders:#?}");
+    let set = &folders[1..]
+        .iter()
+        .find(|f| f.directory.ends_with("a/b"))
+        .unwrap()
+        .found
+        .sets[0];
+    assert_eq!(set.candidates.len(), 1);
+    assert_eq!(set.candidates[0].reclaims, 695499);
+}
+
+#[test]
+fn the_recursive_command_prints_only_folders_with_something_in_them() {
+    let Some(work) = sample_tree() else {
+        eprintln!("skipping: the sample set is absent");
+        return;
+    };
+
+    let run = std::process::Command::new(env!("CARGO_BIN_EXE_mrimgx-consolidate"))
+        .args(["scan", "--recursive"])
+        .arg(work.path())
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let text = String::from_utf8(run.stdout).unwrap();
+
+    assert!(
+        text.contains(&format!("== {}", work.path().join("a/b").display())),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("== {}", work.path().join("plain").display())),
+        "{text}"
+    );
+    // The root and a hold no backup file, so they print no header.
+    assert_eq!(text.matches("== ").count(), 2, "{text}");
+    assert!(
+        text.contains(
+            "4 folders scanned, 2 backup sets, 2 can be merged, reclaiming up to 1390998 bytes"
+        ),
+        "{text}"
+    );
+}
+
 #[test]
 fn a_missing_incremental_after_the_base_is_still_refused() {
     // The completeness rule no longer asks for every number from zero, because retention

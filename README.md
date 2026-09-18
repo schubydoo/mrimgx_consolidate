@@ -85,6 +85,17 @@ set 584221F3840B0DBE  4 files, 51285734 bytes, newest /mnt/backups/...-03-03.mri
     files 1 through 3  incremental merge  moves 7536640 bytes, reclaims 4023102 bytes
 ```
 
+To scan every folder below a path, add `--recursive`. It prints only the folders that hold a
+backup file, then a total. It does not follow links to folders, and it does not enter snapshot
+folders such as `.zfs`, which hold copies of the same sets:
+
+```sh
+mrimgx-consolidate scan --recursive /mnt/backups
+```
+
+A scan opens every file read-only and reads only the metadata, so it is safe to run on live
+backups.
+
 Report what a merge moves, and write nothing:
 
 ```sh
