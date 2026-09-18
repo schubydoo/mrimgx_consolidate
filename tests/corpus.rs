@@ -25,6 +25,7 @@ use mrimgx_consolidate::json;
 use mrimgx_consolidate::plan;
 use mrimgx_consolidate::reader::BackupFile;
 use mrimgx_consolidate::set::BackupSet;
+use mrimgx_consolidate::verify;
 use mrimgx_consolidate::write;
 
 fn corpus() -> Option<PathBuf> {
@@ -1469,6 +1470,86 @@ fn the_compressed_and_the_encrypted_sets_merge_whole() {
         );
         eprintln!("{label}: {compared} copied blocks compared against their sources");
     }
+}
+
+#[test]
+fn the_end_to_end_test_hashes_every_block_of_an_uncompressed_output() {
+    // The reference restore tests md5_hash only when compression is on, so an uncompressed
+    // set gets no integrity test from it at all. This one tests every block.
+    let Some(dir) = corpus() else {
+        eprintln!("skipping: testdata/ is absent");
+        return;
+    };
+    let source_dir = dir.join("Backup-Set");
+    let from = source_dir.join("DD5A77E6B68A6C34-Full-00-00.mrimg");
+    let to = source_dir.join("DD5A77E6B68A6C34-Full-01-01.mrimg");
+    if !to.exists() {
+        eprintln!("skipping: the two-file set is absent");
+        return;
+    }
+
+    let out_dir = tempfile::tempdir().unwrap();
+    let merged = out_dir.path().join("MERGED-00-00.mrimg");
+    merge(&from, &to, &merged);
+
+    let report = verify::verify_file(&merged, None).unwrap();
+    assert_eq!(report.blocks, 237, "every block of the output is tested");
+    assert_eq!(report.bytes, 15_532_032);
+    assert_eq!(report.elsewhere, 0, "a synthetic Full holds all of its own");
+
+    // A deliberately corrupted output is reported as a mismatch.
+    let mut bytes = std::fs::read(&merged).unwrap();
+    bytes[1024] ^= 0xff;
+    std::fs::write(&merged, &bytes).unwrap();
+    let error = verify::verify_file(&merged, None).unwrap_err().to_string();
+    assert!(
+        error.contains("does not match the hash the index records"),
+        "{error}"
+    );
+}
+
+#[test]
+fn the_end_to_end_test_decrypts_and_decompresses_the_encrypted_set() {
+    // The set is high compression and AES-128. Every block is decrypted, decompressed and
+    // hashed, which is the only test that proves a copied block is still the block it was.
+    //
+    // The password is not in this repository. Put it in MRIMGX_TEST_PASSWORD to run this.
+    let Some(dir) = corpus() else {
+        eprintln!("skipping: testdata/ is absent");
+        return;
+    };
+    let Ok(password) = std::env::var("MRIMGX_TEST_PASSWORD") else {
+        eprintln!("skipping: MRIMGX_TEST_PASSWORD is not set");
+        return;
+    };
+    let source_dir = dir.join("PASS");
+    let from = source_dir.join("E9A7F5B2D6166D7C-NOPASS-01-01.mrimgx");
+    let to = source_dir.join("E9A7F5B2D6166D7C-NOPASS-02-02.mrimgx");
+    if !to.exists() {
+        eprintln!("skipping: the encrypted set is absent");
+        return;
+    }
+
+    let out_dir = tempfile::tempdir().unwrap();
+    let merged = out_dir.path().join("MERGED-02-02.mrimgx");
+    merge(&from, &to, &merged);
+
+    let report = verify::verify_file(&merged, Some(&password)).unwrap();
+    assert_eq!(report.blocks, 8628);
+    assert!(report.bytes > 500_000_000, "{} bytes", report.bytes);
+    // Nothing is left untested: a delta index names only the positions the absorbed files
+    // changed, and every one of those moved into the output.
+    assert_eq!(report.elsewhere, 0);
+
+    // A wrong password is reported as a wrong password, not as a corrupt block.
+    let error = verify::verify_file(&merged, Some("not the password"))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("the password is wrong"), "{error}");
+
+    // And with no password at all, the run says what it needs.
+    let error = verify::verify_file(&merged, None).unwrap_err().to_string();
+    assert!(error.contains("needs its password"), "{error}");
 }
 
 #[test]

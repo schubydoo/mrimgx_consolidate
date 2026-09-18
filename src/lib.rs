@@ -13,9 +13,11 @@
 pub mod block;
 pub mod cli;
 pub mod commit;
+pub mod crypto;
 pub mod index;
 pub mod json;
 pub mod plan;
 pub mod reader;
 pub mod set;
+pub mod verify;
 pub mod write;

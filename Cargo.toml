@@ -41,6 +41,12 @@ tempfile = "3"
 # Free space and space reservation, which the standard library does not expose. Both calls
 # are safe wrappers here, which keeps this crate free of unsafe code.
 rustix = { version = "1.1.4", features = ["fs"] }
+sha2 = "0.11.0"
+hmac = "0.13.0"
+aes = "0.9.3"
+cbc = "0.2.1"
+cipher = "0.5.2"
+pbkdf2 = { version = "0.13.0", default-features = false, features = ["hmac"] }
 
 [dev-dependencies]
 serde_json = "1"

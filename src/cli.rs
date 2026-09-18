@@ -12,6 +12,7 @@ use crate::json;
 use crate::plan::{self, MergeKind};
 use crate::reader::BackupFile;
 use crate::set::BackupSet;
+use crate::verify;
 use crate::write;
 
 #[derive(Parser, Debug)]
@@ -48,6 +49,11 @@ pub enum Command {
         /// Clear a lock left behind by a killed run, then stop.
         #[arg(long)]
         recover: bool,
+        /// After writing, decrypt and decompress every block of the output and compare it
+        /// against the hash the index records. An encrypted set needs its password in
+        /// MRIMGX_PASSWORD.
+        #[arg(long)]
+        verify_md5: bool,
     },
     /// Resolve a backup set and report where every logical block lives.
     Resolve {
@@ -70,7 +76,8 @@ pub fn run() -> Result<()> {
             out,
             dry_run,
             recover,
-        } => consolidate(&from, &to, out.as_deref(), dry_run, recover),
+            verify_md5,
+        } => consolidate(&from, &to, out.as_deref(), dry_run, recover, verify_md5),
     }
 }
 
@@ -80,6 +87,7 @@ fn consolidate(
     out: Option<&Path>,
     dry_run: bool,
     recover: bool,
+    verify_md5: bool,
 ) -> Result<()> {
     if recover {
         let directory = out
@@ -119,11 +127,16 @@ fn consolidate(
     }
     let out = out
         .context("give --out FILE to write the merge, or --dry-run to report what it would move")?;
-    write_merge(&set, &plan, out)
+    write_merge(&set, &plan, out, verify_md5)
 }
 
 /// Write the merge, commit it, and read it back.
-fn write_merge(set: &BackupSet, plan: &plan::MergePlan, out: &Path) -> Result<()> {
+fn write_merge(
+    set: &BackupSet,
+    plan: &plan::MergePlan,
+    out: &Path,
+    verify_md5: bool,
+) -> Result<()> {
     for member in &set.members {
         ensure!(
             !is_same_file(&member.path, out),
@@ -195,6 +208,22 @@ fn write_merge(set: &BackupSet, plan: &plan::MergePlan, out: &Path) -> Result<()
     }
     if committed.rename_error_was_wrong {
         println!("  the rename reported an error for work it had already done");
+    }
+    if verify_md5 {
+        // The password never comes from the command line, because arguments show up in the
+        // process list.
+        let password = std::env::var("MRIMGX_PASSWORD").ok();
+        let verified = verify::verify_file(out, password.as_deref())?;
+        println!(
+            "  verified         {} blocks, {} bytes of plaintext, every hash matched",
+            verified.blocks, verified.bytes
+        );
+        if verified.elsewhere > 0 {
+            println!(
+                "  not tested       {} blocks that still live in another file of the set",
+                verified.elsewhere
+            );
+        }
     }
     println!("  these files are now redundant:");
     for number in plan.redundant_file_numbers() {
