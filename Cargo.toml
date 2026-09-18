@@ -38,6 +38,10 @@ zstd = "0.14"
 # directory, so two runs cannot collide and the rename into place stays on one file system.
 tempfile = "3"
 
+# Free space and space reservation, which the standard library does not expose. Both calls
+# are safe wrappers here, which keeps this crate free of unsafe code.
+rustix = { version = "1.1.4", features = ["fs"] }
+
 [dev-dependencies]
 serde_json = "1"
 

@@ -147,6 +147,10 @@ fn write_merge(set: &BackupSet, plan: &plan::MergePlan, out: &Path) -> Result<()
         println!("  note           {caveat}");
     }
 
+    // Refuse now rather than forty gigabytes in.
+    let free = commit::check_free_space(directory, plan.projected_size())?;
+    println!("  free space       {free} bytes");
+
     let note = format!(
         "merging files {} through {}\noutput {}",
         plan.from,
@@ -161,13 +165,16 @@ fn write_merge(set: &BackupSet, plan: &plan::MergePlan, out: &Path) -> Result<()
     if let Some(model) = set.owner(plan.to) {
         temp.take_permissions_from(&model.path)?;
     }
+    if temp.reserve(plan.projected_size()) == commit::Reservation::Unsupported {
+        println!("  note           this file system does not reserve space in advance");
+    }
     let written = {
         let mut writer = BufWriter::new(temp.writer());
         let written = write::write_output(set, plan, &mut source, &mut writer, name)?;
         writer.flush()?;
         written
     };
-    let committed = temp.commit(&mount)?;
+    let committed = temp.commit(&mount, written.size)?;
 
     // Over a network mount only one confirmation is worth trusting: re-open the output and
     // read it back.

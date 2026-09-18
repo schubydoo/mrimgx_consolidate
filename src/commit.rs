@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 
 /// The lock file name, which is the name `Consolidate.exe` uses.
 pub const LOCK_NAME: &str = "merge_running";
@@ -232,6 +232,43 @@ fn file_system_of(mountinfo: &str, directory: &Path) -> Option<String> {
     best.map(|(_, file_system)| file_system)
 }
 
+/// Free space on the file system that holds `directory`, in bytes.
+///
+/// This is the space a person without special privileges can use, which is smaller than the
+/// raw free space on a file system that reserves blocks for root.
+pub fn free_space(directory: &Path) -> Result<u64> {
+    let stat = rustix::fs::statvfs(directory)
+        .with_context(|| format!("reading the free space of {}", directory.display()))?;
+    Ok(stat.f_bavail.saturating_mul(stat.f_frsize))
+}
+
+/// The slack added to the space a merge needs.
+///
+/// The projected size is an estimate of the metadata, so it can be a little low. Sixteen
+/// megabytes covers that and leaves the destination with room to write its own metadata.
+const SPACE_MARGIN: u64 = 16 * 1024 * 1024;
+
+/// Refuse before writing anything, rather than failing forty gigabytes in.
+pub fn check_free_space(directory: &Path, needed: u64) -> Result<u64> {
+    let available = free_space(directory)?;
+    let wanted = needed.saturating_add(SPACE_MARGIN);
+    ensure!(
+        available >= wanted,
+        "{} has {available} bytes free and the merge needs {wanted}, \
+         which is {needed} for the output and {SPACE_MARGIN} of margin",
+        directory.display()
+    );
+    Ok(available)
+}
+
+/// Whether the file system set space aside for the output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reservation {
+    Made,
+    /// The file system does not support it. Nothing is emulated.
+    Unsupported,
+}
+
 /// A partly written output, sitting beside its destination under a temporary name.
 ///
 /// The temporary file is removed when this value is dropped, unless it was committed. So an
@@ -295,14 +332,52 @@ impl TempOutput {
             .with_context(|| format!("setting the permissions of {}", self.temp.display()))
     }
 
+    /// Ask the file system to set `bytes` aside for this file.
+    ///
+    /// A reservation turns a full disk into a refusal before the copy starts. It is not
+    /// supported everywhere, and an unsupported reservation is ignored rather than emulated
+    /// by writing zeros, which would double the work for nothing.
+    ///
+    /// The call extends the file to `bytes`, so [`TempOutput::commit`] cuts it back to what
+    /// was written.
+    pub fn reserve(&self, bytes: u64) -> Reservation {
+        let file = self.file.as_ref().expect("reserve runs before commit");
+        match rustix::fs::fallocate(file, rustix::fs::FallocateFlags::empty(), 0, bytes) {
+            Ok(()) => Reservation::Made,
+            Err(_) => Reservation::Unsupported,
+        }
+    }
+
     /// Flush, close, rename, then flush the directory.
+    ///
+    /// `final_size` is the size the writer reported. The file on disk must match it: a
+    /// reservation leaves the file longer, and a short write leaves it shorter, and the
+    /// second of those is a failure.
     ///
     /// The destination exists when this returns. It has not been read back: that is the
     /// caller's next step, and it is the only confirmation worth trusting over a network
     /// mount.
-    pub fn commit(mut self, mount: &Mount) -> Result<Commit> {
+    pub fn commit(mut self, mount: &Mount, final_size: u64) -> Result<Commit> {
         let file = self.file.take().expect("commit runs once");
         let mut report = Commit::default();
+
+        let length = file
+            .metadata()
+            .with_context(|| format!("measuring {}", self.temp.display()))?
+            .len();
+        if length > final_size {
+            // A reservation set the file longer than the write. Cut it back, which frees
+            // the blocks it set aside.
+            file.set_len(final_size).with_context(|| {
+                format!("cutting {} back to {final_size} bytes", self.temp.display())
+            })?;
+        }
+        ensure!(
+            length >= final_size,
+            "{} is {length} bytes and the writer reported {final_size}. \
+             The write was cut short, so nothing is renamed into place",
+            self.temp.display()
+        );
 
         // A failed flush is never retried. The copy in the page cache is possibly gone, so
         // the only honest move is to abort and leave every source untouched.
@@ -522,7 +597,7 @@ mod tests {
         let temp = output.temp_path().to_path_buf();
         output.writer().write_all(b"the output").unwrap();
 
-        let report = output.commit(&Mount::of(dir.path())).unwrap();
+        let report = output.commit(&Mount::of(dir.path()), 10).unwrap();
         assert_eq!(
             report,
             Commit::default(),
@@ -601,6 +676,56 @@ a line this parser does not understand";
         );
     }
 
+    #[test]
+    fn a_merge_that_does_not_fit_is_refused_before_anything_is_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let available = free_space(dir.path()).unwrap();
+        assert!(available > 0, "the test directory has free space");
+
+        let error = check_free_space(dir.path(), available)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("and the merge needs"), "{error}");
+        // A merge that fits, margin included, is allowed.
+        check_free_space(dir.path(), 1024).unwrap();
+    }
+
+    #[test]
+    fn a_reservation_is_cut_back_to_what_was_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("MERGED-00-00.mrimgx");
+        let mut output = TempOutput::create(&destination).unwrap();
+        // A file system that does not support this reports so and nothing is emulated.
+        let reserved = output.reserve(4096);
+        if reserved == Reservation::Made {
+            let length = std::fs::metadata(output.temp_path()).unwrap().len();
+            assert_eq!(length, 4096, "the reservation extends the file");
+        }
+        output.writer().write_all(b"the output").unwrap();
+
+        output.commit(&Mount::of(dir.path()), 10).unwrap();
+
+        assert_eq!(std::fs::metadata(&destination).unwrap().len(), 10);
+    }
+
+    #[test]
+    fn a_write_that_was_cut_short_is_never_renamed_into_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("MERGED-00-00.mrimgx");
+        let mut output = TempOutput::create(&destination).unwrap();
+        output.writer().write_all(b"half").unwrap();
+
+        // The writer reported more bytes than reached the disk.
+        let error = output
+            .commit(&Mount::of(dir.path()), 4096)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("was cut short"), "{error}");
+        assert!(!destination.exists());
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_rename_refused_for_permission_is_retried_with_backoff() {
@@ -618,9 +743,12 @@ a line this parser does not understand";
 
         let started = std::time::Instant::now();
         let error = output
-            .commit(&Mount::Remote {
-                file_system: "smb3".into(),
-            })
+            .commit(
+                &Mount::Remote {
+                    file_system: "smb3".into(),
+                },
+                10,
+            )
             .unwrap_err();
         let waited = started.elapsed();
 
