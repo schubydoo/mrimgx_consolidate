@@ -826,7 +826,9 @@ fn patching_a_real_document_records_the_merge_and_leaks_no_path() {
     let patched = write::patch_document(&set, &plan, 16_777_216, "MERGED-00-00.mrimg").unwrap();
     let doc: serde_json::Value = serde_json::from_slice(&patched).unwrap();
 
-    assert_eq!(doc["_header"]["merged_files"], serde_json::json!([0]));
+    // The output claims the From file's number, so the list holds what it absorbed: file 1.
+    assert_eq!(doc["_header"]["file_number"], 0);
+    assert_eq!(doc["_header"]["merged_files"], serde_json::json!([1]));
     assert_eq!(doc["_header"]["index_file_position"], 16_777_216u64);
     assert_eq!(doc["_header"]["delta_index"], false);
     assert_eq!(doc["_header"]["backup_type"], "full");
@@ -856,7 +858,7 @@ fn patching_a_real_document_records_the_merge_and_leaks_no_path() {
         for part in disk["partitions"].as_array().unwrap() {
             let history = part["_header"]["file_history"].as_array().unwrap();
             assert_eq!(history.len(), 1, "the output absorbed the whole set");
-            assert_eq!(history[0]["file_number"], 1);
+            assert_eq!(history[0]["file_number"], 0);
             assert_eq!(history[0]["file_name"], "MERGED-00-00.mrimg");
             assert_eq!(part["_header"]["file_history_count"], 1);
         }
@@ -934,7 +936,8 @@ fn the_written_output_reads_back_and_resolves_to_the_same_blocks() {
     assert_eq!(output.root_at, written.root_at);
     assert_eq!(output.trailing_bytes(), block::FOOTER_LEN);
     assert_eq!(output.header.index_file_position, written.data.end);
-    assert_eq!(output.header.merged_files, vec![0]);
+    assert_eq!(output.header.file_number, 0, "it claims the From file");
+    assert_eq!(output.header.merged_files, vec![1]);
     assert!(
         !output.header.delta_index,
         "a synthetic Full is not a delta"
@@ -959,7 +962,7 @@ fn the_written_output_reads_back_and_resolves_to_the_same_blocks() {
                 }
                 assert_eq!(new.block_length, old.block_length, "{at}");
                 assert_eq!(new.md5_hash, old.md5_hash, "{at}");
-                assert_eq!(new.file_number, 1, "{at} belongs to the output");
+                assert_eq!(new.file_number, 0, "{at} belongs to the output");
                 compared += 1;
             }
         }
@@ -1012,7 +1015,8 @@ fn an_incremental_merge_keeps_the_full_and_still_resolves() {
         output.header.delta_index,
         "an incremental merge stays delta"
     );
-    assert_eq!(output.header.merged_files, vec![1, 2]);
+    assert_eq!(output.header.file_number, 1, "it claims the From file");
+    assert_eq!(output.header.merged_files, vec![2, 3]);
 
     let after = BackupSet::discover(&out_path).unwrap();
     assert_eq!(
@@ -1036,7 +1040,7 @@ fn an_incremental_merge_keeps_the_full_and_still_resolves() {
                 assert_eq!(new.md5_hash, old.md5_hash, "{at}");
                 // A block either moved into the output or still belongs to the Full.
                 assert!(
-                    new.file_number == 3 || new.file_number == 0,
+                    new.file_number == 1 || new.file_number == 0,
                     "{at} points at file {}",
                     new.file_number
                 );
@@ -1048,7 +1052,7 @@ fn an_incremental_merge_keeps_the_full_and_still_resolves() {
     let per_file = after.blocks_per_file();
     assert_eq!(per_file.len(), 2);
     assert_eq!(per_file[&0], 561);
-    assert_eq!(per_file[&3], 43 + 27 + 45);
+    assert_eq!(per_file[&1], 43 + 27 + 45);
 }
 
 #[test]
@@ -1359,10 +1363,12 @@ fn every_pair_of_the_multi_partition_set_merges_and_extracts() {
 
         let output = BackupFile::open(&merged, true).unwrap();
         output.check_framing().unwrap();
-        assert_eq!(output.header.file_number, to);
+        // The output takes over the From file's identity, the way the original tool leaves
+        // it, and lists every number above that which it absorbed.
+        assert_eq!(output.header.file_number, from);
         assert_eq!(
             output.header.merged_files,
-            (from..to).map(i64::from).collect::<Vec<_>>(),
+            (from + 1..=to).map(i64::from).collect::<Vec<_>>(),
             "the output claims every number it absorbed"
         );
         // A merge that starts at the Full stands alone and carries a complete index. One
@@ -1429,7 +1435,8 @@ fn the_compressed_and_the_encrypted_sets_merge_whole() {
         let output = BackupFile::open(&merged, true).unwrap();
         output.check_framing().unwrap();
         write::check_output(&merged, &plan).unwrap();
-        assert_eq!(output.header.merged_files, vec![1], "{label}");
+        assert_eq!(output.header.file_number, 1, "{label}");
+        assert_eq!(output.header.merged_files, vec![2], "{label}");
 
         // The settings are carried through, because the blocks were not re-encoded.
         let to = set.owner(2).unwrap();
@@ -2034,7 +2041,8 @@ fn a_killed_merge_damages_nothing_and_recovery_clears_it() {
     merge(&member("00-00"), &member("02-02"), &out_path);
     let output = BackupFile::open(&out_path, true).unwrap();
     output.check_framing().unwrap();
-    assert_eq!(output.header.merged_files, vec![0, 1]);
+    assert_eq!(output.header.file_number, 0);
+    assert_eq!(output.header.merged_files, vec![1, 2]);
 }
 
 #[test]
@@ -2077,8 +2085,9 @@ fn a_merge_of_a_merge_still_resolves_and_extracts() {
     std::fs::remove_file(member("02-02")).unwrap();
 
     let output = BackupFile::open(&second, true).unwrap();
-    assert_eq!(output.header.file_number, 2);
-    assert_eq!(output.header.merged_files, vec![0, 1]);
+    // Both merges started at file 0, so the output carries that number and lists the rest.
+    assert_eq!(output.header.file_number, 0);
+    assert_eq!(output.header.merged_files, vec![1, 2]);
     assert!(!output.header.delta_index, "it carries a complete index");
     // It claims every number of the chain it replaced, so it is a set on its own.
     let set = BackupSet::discover(&second).unwrap();

@@ -286,8 +286,12 @@ pub fn build(set: &BackupSet, from_number: u16, to_number: u16) -> Result<MergeP
         kind,
         absorbed,
         partitions,
-        out_file_number: to.header.file_number,
-        out_increment_number: to.header.increment_number,
+        // The output claims the identity of the From file, which is what the original tool
+        // leaves behind: it merges into that file and deletes the rest of the range. Macrium
+        // Reflect X groups a set around it and shows a merged file that claims the last file
+        // of the range under Orphan Files instead. Measured in 10.0.8843 on 2026-09-18.
+        out_file_number: from.header.file_number,
+        out_increment_number: from.header.increment_number,
         metadata_bytes,
     })
 }
