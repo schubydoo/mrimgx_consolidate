@@ -15,10 +15,12 @@ use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 
 use anyhow::{ensure, Context, Result};
+use serde_json::{Map, Value};
 
 use crate::block::{self, align_up, MetadataBlockHeader};
 use crate::index::{Blocks, DataBlockIndexElement, DeltaDataBlock, PartitionIndex};
-use crate::plan::{Action, MergePlan, PartitionPlan};
+use crate::json;
+use crate::plan::{Action, MergeKind, MergePlan, PartitionPlan};
 use crate::reader::Disk;
 use crate::set::BackupSet;
 
@@ -361,6 +363,193 @@ fn copy_range<W: Write, S: BlockSource>(
         done += u64::from(take);
     }
     Ok(())
+}
+
+/// Patch the metadata document of the To file and return it in canonical form.
+///
+/// The round-trip gate runs first. If re-serializing the untouched document does not
+/// reproduce the source bytes, this crate cannot rewrite the metadata of this file, and the
+/// run stops before anything is written.
+///
+/// `output_name` is the file name of the output with no directory. Every path the document
+/// carries is replaced, because a real file records absolute paths from the machine that
+/// took the backup, such as `C:\Users\<name>\Desktop\...`, and the output must not carry
+/// them. Volume device paths such as `\\?\Volume{...}` stay: they describe the imaged
+/// volume, not a directory on that machine.
+pub fn patch_document(
+    set: &BackupSet,
+    plan: &MergePlan,
+    index_file_position: u64,
+    output_name: &str,
+) -> Result<Vec<u8>> {
+    let to = set
+        .owner(plan.to)
+        .with_context(|| format!("no member of the set owns file number {}", plan.to))?;
+    json::check_round_trip(&to.json, &to.json_raw)
+        .with_context(|| format!("the $JSON block of {}", to.path.display()))?;
+
+    let mut doc = to.json.clone();
+    patch_header(&mut doc, plan, index_file_position)?;
+    patch_partitions(&mut doc, plan, output_name)?;
+    patch_auxiliary_data(&mut doc, plan, output_name)?;
+    if plan.kind == MergeKind::SyntheticFull {
+        patch_disk_sizes(&mut doc, &set.base()?.json)?;
+    }
+
+    json::canonical(&doc)
+}
+
+/// Record what the output is: its number, what it absorbed, and the shape of its index.
+fn patch_header(doc: &mut Value, plan: &MergePlan, index_file_position: u64) -> Result<()> {
+    let header = object_mut(doc, "_header")?;
+    header.insert("file_number".into(), plan.out_file_number.into());
+    header.insert("increment_number".into(), plan.out_increment_number.into());
+    // Absent from every unconsolidated file, so this inserts the key rather than replacing
+    // it. The output's own number is not in the list: that number names the file itself.
+    let merged: Vec<u16> = plan
+        .redundant_file_numbers()
+        .into_iter()
+        .filter(|n| *n != plan.out_file_number)
+        .collect();
+    header.insert("merged_files".into(), merged.into());
+    header.insert("index_file_position".into(), index_file_position.into());
+    header.insert("delta_index".into(), plan.kind.delta_index().into());
+    // The output is one file. A split continuation is refused before the write starts.
+    header.insert("split_file".into(), false.into());
+    if plan.kind == MergeKind::SyntheticFull {
+        // The output carries a complete index, so it is a Full whatever the backup
+        // definition called the To file.
+        header.insert("backup_type".into(), "full".into());
+    }
+    Ok(())
+}
+
+/// Rewrite the per-partition file history so that it names files rather than paths.
+///
+/// An absorbed number now lives in the output, so its entry names the output. Any other
+/// entry keeps its own file name with the directory removed. The name is a locator hint:
+/// the reference reader resolves it against the directory it was given.
+fn patch_partitions(doc: &mut Value, plan: &MergePlan, output_name: &str) -> Result<()> {
+    let disks = doc
+        .get_mut("disks")
+        .and_then(Value::as_array_mut)
+        .context("the $JSON document has no disks array")?;
+
+    for (d, disk) in disks.iter_mut().enumerate() {
+        let partitions = disk
+            .get_mut("partitions")
+            .and_then(Value::as_array_mut)
+            .with_context(|| format!("disks[{d}] has no partitions array"))?;
+
+        for (p, part) in partitions.iter_mut().enumerate() {
+            let header = object_mut(part, "_header")
+                .with_context(|| format!("disk {d} partition {p} of the $JSON document"))?;
+            let count = {
+                let Some(history) = header.get_mut("file_history").and_then(Value::as_array_mut)
+                else {
+                    continue;
+                };
+                for entry in history.iter_mut() {
+                    let number = entry
+                        .get("file_number")
+                        .and_then(Value::as_u64)
+                        .and_then(|n| u16::try_from(n).ok());
+                    let recorded = entry.get("file_name").and_then(Value::as_str).unwrap_or("");
+                    let name = match number {
+                        Some(n) if plan.absorbed.contains(&n) => output_name.to_string(),
+                        _ => bare_name(recorded),
+                    };
+                    if let Some(entry) = entry.as_object_mut() {
+                        entry.insert("file_name".into(), name.into());
+                    }
+                }
+                history.len()
+            };
+            header.insert("file_history_count".into(), count.into());
+        }
+    }
+    Ok(())
+}
+
+/// Record the merge in the backup definition, and drop the paths it carries.
+fn patch_auxiliary_data(doc: &mut Value, plan: &MergePlan, output_name: &str) -> Result<()> {
+    let aux = object_mut(doc, "_auxiliary_data")?;
+    // The full path of the output, which the tool that wrote it recorded.
+    if aux.contains_key("destination") {
+        aux.insert("destination".into(), output_name.into());
+    }
+
+    let definition = aux
+        .get_mut("backup_definition")
+        .and_then(Value::as_object_mut)
+        .context("_auxiliary_data has no backup_definition object")?;
+    definition.insert(
+        "consolidation_type".into(),
+        plan.kind.consolidation_type().into(),
+    );
+    if definition.contains_key("filename") {
+        definition.insert("filename".into(), output_name.into());
+    }
+    // The definition file lives on the machine that took the backup, so only its name is
+    // kept.
+    let bare = definition
+        .get("backup_definition_file")
+        .and_then(Value::as_str)
+        .map(bare_name);
+    if let Some(bare) = bare {
+        definition.insert("backup_definition_file".into(), bare.into());
+    }
+    Ok(())
+}
+
+/// Take `disk_size` from the file that carries the full index.
+///
+/// A Full records the true device size. An Incremental records the CHS product, which
+/// rounds down to a whole cylinder, so the To file's value is wrong for a synthetic Full.
+/// An extraction sized from the wrong member produces a false result in either direction.
+fn patch_disk_sizes(doc: &mut Value, base: &Value) -> Result<()> {
+    let sizes: Vec<Value> = base
+        .get("disks")
+        .and_then(Value::as_array)
+        .context("the file with the full index has no disks array")?
+        .iter()
+        .enumerate()
+        .map(|(d, disk)| {
+            disk.get("_geometry")
+                .and_then(|g| g.get("disk_size"))
+                .cloned()
+                .with_context(|| {
+                    format!("disks[{d}] of the file with the full index has no _geometry.disk_size")
+                })
+        })
+        .collect::<Result<_>>()?;
+
+    let disks = doc
+        .get_mut("disks")
+        .and_then(Value::as_array_mut)
+        .context("the $JSON document has no disks array")?;
+    ensure!(
+        disks.len() == sizes.len(),
+        "the To file holds {} disks but the file with the full index holds {}",
+        disks.len(),
+        sizes.len()
+    );
+    for (disk, size) in disks.iter_mut().zip(sizes) {
+        object_mut(disk, "_geometry")?.insert("disk_size".into(), size);
+    }
+    Ok(())
+}
+
+fn object_mut<'a>(value: &'a mut Value, key: &str) -> Result<&'a mut Map<String, Value>> {
+    value
+        .get_mut(key)
+        .and_then(Value::as_object_mut)
+        .with_context(|| format!("the $JSON document has no {key} object"))
+}
+
+/// The file name with any directory removed, for both Windows and Unix separators.
+fn bare_name(path: &str) -> String {
+    path.rsplit(['\\', '/']).next().unwrap_or(path).to_string()
 }
 
 #[cfg(test)]
@@ -789,5 +978,144 @@ mod tests {
             write_metadata_region(&disks, &data, &mut source, &mut Vec::new(), 1).unwrap_err();
 
         assert!(err.to_string().contains("describes 0 partitions"));
+    }
+
+    /// A document shaped like a real one: paths from the machine that took the backup, no
+    /// `merged_files` key, and a file history that names one file outside the merge.
+    fn document() -> Value {
+        serde_json::json!({
+            "_auxiliary_data": {
+                "backup_definition": {
+                    "backup_definition_file": "C:\\Users\\someone\\Documents\\Reflect\\Full.xml",
+                    "consolidation_type": "none",
+                    "filename": "C:\\Users\\someone\\Desktop\\SET-01-01.mrimgx"
+                },
+                "destination": "C:\\Users\\someone\\Desktop\\SET-01-01.mrimgx"
+            },
+            "_header": {
+                "backup_type": "inc",
+                "delta_index": true,
+                "file_number": 1,
+                "imageid": "DD5A77E6B68A6C34",
+                "increment_number": 1,
+                "index_file_position": 4096,
+                "split_file": false
+            },
+            "disks": [{
+                "_geometry": { "disk_size": 534643200u64 },
+                "partitions": [{
+                    "_header": {
+                        "file_history": [
+                            {
+                                "file_name": "C:\\Users\\someone\\Desktop\\SET-00-00.mrimgx",
+                                "file_number": 0
+                            },
+                            {
+                                "file_name": "C:\\Users\\someone\\Desktop\\SET-01-01.mrimgx",
+                                "file_number": 1
+                            },
+                            {
+                                "file_name": "D:\\elsewhere\\SET-07-07.mrimgx",
+                                "file_number": 7
+                            }
+                        ],
+                        "file_history_count": 3
+                    }
+                }]
+            }]
+        })
+    }
+
+    #[test]
+    fn the_patched_header_records_what_the_output_is() {
+        let plan = plan_with(MergeKind::SyntheticFull, Vec::new(), Vec::new());
+        let mut doc = document();
+
+        patch_header(&mut doc, &plan, 8192).unwrap();
+
+        let header = &doc["_header"];
+        assert_eq!(header["file_number"], 1);
+        assert_eq!(header["increment_number"], 1);
+        // The key was absent, so it is inserted. File 1 is the output itself, not something
+        // it absorbed.
+        assert_eq!(header["merged_files"], serde_json::json!([0]));
+        assert_eq!(header["index_file_position"], 8192);
+        assert_eq!(header["delta_index"], false);
+        assert_eq!(header["split_file"], false);
+        assert_eq!(header["backup_type"], "full");
+    }
+
+    #[test]
+    fn an_incremental_merge_keeps_the_delta_index_and_the_backup_type() {
+        let plan = plan_with(MergeKind::IncrementalMerge, Vec::new(), Vec::new());
+        let mut doc = document();
+
+        patch_header(&mut doc, &plan, 8192).unwrap();
+
+        assert_eq!(doc["_header"]["delta_index"], true);
+        assert_eq!(doc["_header"]["backup_type"], "inc");
+    }
+
+    #[test]
+    fn the_file_history_names_files_and_carries_no_path() {
+        let plan = plan_with(MergeKind::SyntheticFull, Vec::new(), Vec::new());
+        let mut doc = document();
+
+        patch_partitions(&mut doc, &plan, "SET-01-01.mrimgx").unwrap();
+
+        let header = &doc["disks"][0]["partitions"][0]["_header"];
+        let history = header["file_history"].as_array().unwrap();
+        // Files 0 and 1 are absorbed, so their bytes live in the output. File 7 is not, so
+        // it keeps its own name with the directory removed.
+        assert_eq!(history[0]["file_name"], "SET-01-01.mrimgx");
+        assert_eq!(history[1]["file_name"], "SET-01-01.mrimgx");
+        assert_eq!(history[2]["file_name"], "SET-07-07.mrimgx");
+        assert_eq!(header["file_history_count"], 3);
+    }
+
+    #[test]
+    fn the_auxiliary_data_records_the_merge_and_drops_the_paths() {
+        let plan = plan_with(MergeKind::IncrementalMerge, Vec::new(), Vec::new());
+        let mut doc = document();
+
+        patch_auxiliary_data(&mut doc, &plan, "OUT.mrimgx").unwrap();
+
+        let aux = &doc["_auxiliary_data"];
+        assert_eq!(
+            aux["backup_definition"]["consolidation_type"],
+            "incremental_merge"
+        );
+        assert_eq!(aux["backup_definition"]["filename"], "OUT.mrimgx");
+        assert_eq!(
+            aux["backup_definition"]["backup_definition_file"],
+            "Full.xml"
+        );
+        assert_eq!(aux["destination"], "OUT.mrimgx");
+    }
+
+    #[test]
+    fn a_synthetic_full_takes_disk_size_from_the_file_with_the_full_index() {
+        let mut doc = document();
+        // The Full records the true device size. The To file rounded it down to a cylinder.
+        let base = serde_json::json!({ "disks": [{ "_geometry": { "disk_size": 534672384u64 } }] });
+
+        patch_disk_sizes(&mut doc, &base).unwrap();
+
+        assert_eq!(doc["disks"][0]["_geometry"]["disk_size"], 534672384u64);
+    }
+
+    #[test]
+    fn a_disk_count_that_does_not_match_the_full_index_file_is_refused() {
+        let mut doc = document();
+        let base = serde_json::json!({
+            "disks": [
+                { "_geometry": { "disk_size": 1u64 } },
+                { "_geometry": { "disk_size": 2u64 } }
+            ]
+        });
+
+        let err = patch_disk_sizes(&mut doc, &base).unwrap_err();
+
+        assert!(err.to_string().contains("1 disks"), "{err}");
     }
 }

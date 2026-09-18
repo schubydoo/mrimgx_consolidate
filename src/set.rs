@@ -108,6 +108,14 @@ impl BackupSet {
         self.owners.get(&file_number).map(|i| &self.members[*i])
     }
 
+    /// The member that carries a complete index of its own, which is the base of the chain.
+    ///
+    /// A synthetic Full takes `disk_size` from this file, because an Incremental records the
+    /// CHS product rather than the true device size.
+    pub fn base(&self) -> Result<&BackupFile> {
+        Ok(&self.members[self.base_index()?])
+    }
+
     /// Make sure that the file numbers form a gapless run from zero.
     ///
     /// A missing middle file leaves the chain unresolvable, and the failure would

@@ -775,6 +775,88 @@ fn copying_a_compressed_set_moves_the_stored_bytes_untouched() {
     assert_eq!(region.end % block::DATA_ALIGNMENT, 0);
 }
 
+/// Every string in `value` that starts with a drive letter, which is what a path from the
+/// machine that took the backup looks like.
+fn drive_letter_paths(value: &serde_json::Value, at: String, found: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, child) in map {
+                drive_letter_paths(child, format!("{at}.{key}"), found);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for (i, child) in items.iter().enumerate() {
+                drive_letter_paths(child, format!("{at}[{i}]"), found);
+            }
+        }
+        serde_json::Value::String(text) => {
+            let bytes = text.as_bytes();
+            if bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && &text[1..3] == ":\\" {
+                found.push(format!("{at} = {text}"));
+            }
+        }
+        _ => {}
+    }
+}
+
+#[test]
+fn patching_a_real_document_records_the_merge_and_leaks_no_path() {
+    let Some(dir) = corpus() else {
+        eprintln!("skipping: testdata/ is absent");
+        return;
+    };
+    let target = dir.join("Backup-Set/DD5A77E6B68A6C34-Full-01-01.mrimg");
+    if !target.exists() {
+        eprintln!("skipping: the two-file set is absent");
+        return;
+    }
+
+    let set = BackupSet::discover(&target).unwrap();
+    let plan = plan::build(&set, 0, 1).unwrap();
+    let to = set.owner(1).unwrap();
+    let before: serde_json::Value = serde_json::from_slice(&to.json_raw).unwrap();
+    assert!(
+        before["_header"].get("merged_files").is_none(),
+        "an unconsolidated file has no merged_files key, so the patcher must insert it"
+    );
+
+    let patched = write::patch_document(&set, &plan, 16_777_216, "MERGED-00-00.mrimg").unwrap();
+    let doc: serde_json::Value = serde_json::from_slice(&patched).unwrap();
+
+    assert_eq!(doc["_header"]["merged_files"], serde_json::json!([0]));
+    assert_eq!(doc["_header"]["index_file_position"], 16_777_216u64);
+    assert_eq!(doc["_header"]["delta_index"], false);
+    assert_eq!(doc["_header"]["backup_type"], "full");
+    assert_eq!(
+        doc["_auxiliary_data"]["backup_definition"]["consolidation_type"],
+        "synthetic_full"
+    );
+
+    // The Full records the true device size. File 1 rounded it down to a whole cylinder.
+    let full = set.base().unwrap();
+    assert_eq!(full.header.file_number, 0);
+    assert_eq!(
+        doc["disks"][0]["_geometry"]["disk_size"],
+        full.json["disks"][0]["_geometry"]["disk_size"]
+    );
+    assert_ne!(
+        doc["disks"][0]["_geometry"]["disk_size"], before["disks"][0]["_geometry"]["disk_size"],
+        "this set is the one that proves disk_size differs across a chain"
+    );
+
+    let mut leaks = Vec::new();
+    drive_letter_paths(&doc, String::new(), &mut leaks);
+    assert!(leaks.is_empty(), "paths survived the patch: {leaks:?}");
+    // The instrument works: the source document carries five such paths.
+    let mut before_leaks = Vec::new();
+    drive_letter_paths(&before, String::new(), &mut before_leaks);
+    assert!(!before_leaks.is_empty());
+
+    // The patched document is still canonical, so it round-trips through the gate.
+    let reparsed = json::parse(&patched).unwrap();
+    json::check_round_trip(&reparsed, &patched).unwrap();
+}
+
 /// Copy the whole encrypted set and report throughput.
 ///
 /// Ignored by default: it moves about 3.8 GB and needs that much free space. Run it with
