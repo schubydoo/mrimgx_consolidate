@@ -205,7 +205,7 @@ impl BlockList {
 
 /// Read the footer and return the offset of the root metadata list.
 ///
-/// The file is seeked to its end first, so the caller does not need to know its size.
+/// This seeks to the end of the file first, so the caller does not need to know its size.
 pub fn read_footer<R: Read + Seek>(reader: &mut R) -> Result<u64> {
     let size = reader.seek(SeekFrom::End(0))?;
     ensure!(

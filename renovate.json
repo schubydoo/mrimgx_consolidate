@@ -1,0 +1,18 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "local>schubydoo/renovate-config"
+  ],
+  "packageRules": [
+    {
+      "description": "The MSRV job pins the toolchain that Cargo.toml declares. Bump rust-version first, then this.",
+      "matchManagers": [
+        "github-actions"
+      ],
+      "matchDepNames": [
+        "rust"
+      ],
+      "enabled": false
+    }
+  ]
+}

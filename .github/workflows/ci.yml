@@ -1,0 +1,235 @@
+name: CI
+
+# fmt, clippy, rustdoc and typos; the test suite against the public corpus on Linux
+# and macOS; an MSRV build; coverage with a line floor; a FreeBSD cross-check; and a
+# supply-chain audit. One aggregator job, `ci required checks passed`, is what branch
+# protection requires. Add a new required job to its `needs` list.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Least privilege by default (OpenSSF Scorecard Token-Permissions).
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: fmt, clippy, docs, typos
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Spell-check all text, comments included. False positives go in _typos.toml.
+      - name: Typos
+        uses: crate-ci/typos@512fc24f32f44ab01972217aaaf3dc86ec234d53 # v1.50.2
+      # The corpus and oracle scripts run in CI, so hold them to the same bar as the
+      # Rust. shellcheck ships on the runner.
+      - name: ShellCheck (scripts)
+        run: shellcheck scripts/*.sh
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+          rustflags: ""
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy (deny warnings)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      # The only step that fires rustdoc lints, for example a broken intra-doc link.
+      # --document-private-items because the public surface is small and the internals
+      # carry the format notes.
+      - name: Docs (deny warnings)
+        run: cargo doc --no-deps --all-features --document-private-items
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  msrv:
+    # Prove the crate still builds on the version Cargo.toml declares, not only on
+    # latest stable.
+    name: build (MSRV 1.96)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # rustflags: "" and build-warnings: warn keep the action from denying every
+      # warning on the MSRV build. A future deprecation warning must not fail it.
+      # Warnings are denied in the lint job instead.
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          toolchain: 1.96.0
+          rustflags: ""
+          build-warnings: warn
+      - run: cargo build --all-features
+
+  test:
+    # The tests skip when testdata/ is absent, so the corpus fetch is what makes this
+    # job mean anything. macOS runs the same suite without the reference extractor,
+    # which is built on Linux only.
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          toolchain: stable
+          rustflags: ""
+      # nextest instead of `cargo test`: the same gate, plus a junit.xml from the ci
+      # profile in .config/nextest.toml, which is the only format Codecov Test
+      # Analytics reads.
+      - uses: taiki-e/install-action@76c2e6406e52637deed7160d77bded76bd83e06e # v2.87.14
+        with:
+          tool: cargo-nextest
+      # The key holds the upstream commit, because scripts/fetch-corpus.sh pins it.
+      - name: Cache the corpus
+        id: corpus
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            testdata
+            /tmp/mrimgx-corpus
+          key: corpus-${{ runner.os }}-${{ hashFiles('scripts/fetch-corpus.sh') }}
+      - name: Fetch the corpus
+        if: steps.corpus.outputs.cache-hit != 'true'
+        run: ./scripts/fetch-corpus.sh
+      # The independent extractor is the oracle for the strongest tests: it proves the
+      # merged image restores to the same bytes as the chain it replaced.
+      - name: Build the reference extractor
+        if: runner.os == 'Linux'
+        run: ./scripts/build-refextract.sh
+      - name: Test (nextest, JUnit)
+        run: cargo nextest run --all-features --profile ci
+      # nextest does not run doctests. This step reuses the build cache.
+      - name: Doctests
+        run: cargo test --all-features --doc
+      # Non-blocking and tokenless on a public repository. It uploads even on failure,
+      # because nextest writes junit.xml before it exits non-zero, and that is when
+      # the analytics matter.
+      - name: Upload test results to Codecov
+        if: ${{ !cancelled() }}
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          files: target/nextest/ci/junit.xml
+          disable_search: true
+          report_type: test_results
+          fail_ci_if_error: false
+
+  coverage:
+    name: coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          toolchain: stable
+          components: llvm-tools-preview
+          rustflags: ""
+      - uses: taiki-e/install-action@76c2e6406e52637deed7160d77bded76bd83e06e # v2.87.14
+        with:
+          tool: cargo-llvm-cov
+      - name: Cache the corpus
+        id: corpus
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            testdata
+            /tmp/mrimgx-corpus
+          key: corpus-${{ runner.os }}-${{ hashFiles('scripts/fetch-corpus.sh') }}
+      - name: Fetch the corpus
+        if: steps.corpus.outputs.cache-hit != 'true'
+        run: ./scripts/fetch-corpus.sh
+      - name: Build the reference extractor
+        run: ./scripts/build-refextract.sh
+      # The floor is the gate. cargo-llvm-cov writes lcov.info before it checks the
+      # threshold, so the upload still runs when the floor fails. The baseline is
+      # 90.4 percent of lines on the public corpus, measured on 2026-09-18. The two
+      # large private sets, which are compressed and encrypted, cover more of
+      # verify.rs, so a local run reads higher.
+      - name: Coverage (lcov and line floor)
+        run: cargo llvm-cov --all-features --lcov --output-path lcov.info --fail-under-lines 87
+      - name: Upload to Codecov
+        if: ${{ !cancelled() }}
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          files: lcov.info
+          fail_ci_if_error: false
+
+  freebsd:
+    # The README promises FreeBSD. Nothing else compiles for it, and the crate calls
+    # statvfs and fallocate through rustix, which is where a platform gap shows up.
+    # A check needs no linker, so it runs on the Linux runner.
+    name: check (FreeBSD)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          toolchain: stable
+          target: x86_64-unknown-freebsd
+          rustflags: ""
+      - run: cargo check --all-features --all-targets --target x86_64-unknown-freebsd
+
+  supply-chain:
+    name: audit, deny
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@76c2e6406e52637deed7160d77bded76bd83e06e # v2.87.14
+        with:
+          tool: cargo-audit,cargo-deny
+      - name: Audit
+        run: cargo audit
+      - name: Deny
+        run: cargo deny check
+
+  ci-required-checks:
+    # The single status branch protection requires. Add a new required job to `needs`.
+    name: ci required checks passed
+    if: always()
+    needs: [lint, msrv, test, coverage, freebsd, supply-chain]
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Check required jobs passed
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          failing=$(echo "$NEEDS_JSON" | jq -r '
+            to_entries[]
+            | select(.value.result != "success" and .value.result != "skipped")
+            | "\(.key): \(.value.result)"
+          ')
+          if [ -n "$failing" ]; then
+            echo "Failed or cancelled jobs:"
+            echo "$failing"
+            exit 1
+          fi
+          echo "All required jobs passed."

@@ -1,6 +1,9 @@
 # mrimgx-consolidate
 
+[![CI](https://github.com/schubydoo/mrimgx_consolidate/actions/workflows/ci.yml/badge.svg)](https://github.com/schubydoo/mrimgx_consolidate/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/schubydoo/mrimgx_consolidate/branch/main/graph/badge.svg)](https://codecov.io/gh/schubydoo/mrimgx_consolidate)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![MSRV 1.96](https://img.shields.io/badge/MSRV-1.96-blue)](https://blog.rust-lang.org/2026/05/28/Rust-1.96.0/)
 
 Consolidate Macrium Reflect X backup sets from Linux, FreeBSD or macOS.
 
