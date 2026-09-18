@@ -9,8 +9,10 @@
 //! numbers. See [`absorbed_file_numbers`].
 
 use std::collections::BTreeSet;
+use std::path::PathBuf;
 
 use anyhow::{bail, ensure, Context, Result};
+use serde_json::Value;
 
 use crate::block::{self, align_up};
 use crate::index::{Blocks, DataBlockIndexElement};
@@ -388,6 +390,52 @@ fn member_with_number(set: &BackupSet, number: u16) -> Result<&BackupFile> {
 /// The wording of the first four comes from the original tool, so that existing habits and
 /// scripts keep working. Note that it prints no trailing period on those.
 fn check_rules(set: &BackupSet, from: &BackupFile, to: &BackupFile) -> Result<()> {
+    check_pair(from, to)?;
+
+    // Blocks are copied byte for byte, which is only sound when these agree across every
+    // member. A set whose compression changed mid-chain cannot be merged this way, because
+    // data blocks carry no per-block compression flag.
+    for member in &set.members {
+        settings_match(&member.json, &to.json).with_context(|| {
+            format!(
+                "{} does not match the rest of the set",
+                member.path.display()
+            )
+        })?;
+    }
+
+    // A split set is a tool limit rather than a broken set. The continuation file holds
+    // data blocks and no index of its own, and nothing here knows how to carry that shape
+    // into an output.
+    let split = split_in_range(
+        set.members.iter().map(|m| {
+            (
+                m.header.increment_number,
+                m.header.split_file,
+                m.path.clone(),
+            )
+        }),
+        from.header.increment_number,
+        to.header.increment_number,
+    );
+    ensure!(
+        split.is_empty(),
+        "this range holds a split backup file, which this tool cannot merge yet: {}",
+        split
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    Ok(())
+}
+
+/// The four rules that look only at the two files, in the wording of the original tool.
+///
+/// The command line runs these before it discovers the set. A set is discovered as of the To
+/// file, so a From file newer than the To file is not a member at all, and without this the
+/// run would report a missing file number rather than the documented message.
+pub fn check_pair(from: &BackupFile, to: &BackupFile) -> Result<()> {
     if from.header.imageid != to.header.imageid {
         bail!("Error: From and To files are from a different backup set");
     }
@@ -404,38 +452,49 @@ fn check_rules(set: &BackupSet, from: &BackupFile, to: &BackupFile) -> Result<()
         from.header.file_number != to.header.file_number,
         "the From and To files are the same file, so there is nothing to merge"
     );
-
-    // Blocks are copied byte for byte, which is only sound when these agree across every
-    // member. A set whose compression changed mid-chain cannot be merged this way, because
-    // data blocks carry no per-block compression flag.
-    let reference = to;
-    for member in &set.members {
-        let same = |path: &[&str]| -> bool {
-            let pick = |f: &BackupFile| {
-                path.iter()
-                    .try_fold(&f.json, |v, key| v.get(*key))
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null)
-            };
-            pick(member) == pick(reference)
-        };
-        ensure!(
-            same(&["_compression", "compression_level"])
-                && same(&["_compression", "compression_method"]),
-            "{} uses different compression from the rest of the set, so its blocks cannot \
-             be copied without re-encoding them",
-            member.path.display()
-        );
-        ensure!(
-            same(&["_encryption", "enable"])
-                && same(&["_encryption", "aes_type"])
-                && same(&["_encryption", "key_iterations"]),
-            "{} uses different encryption from the rest of the set, so its blocks cannot \
-             be copied without re-encrypting them",
-            member.path.display()
-        );
-    }
     Ok(())
+}
+
+/// Whether two documents agree on how their data blocks are stored.
+fn settings_match(member: &Value, reference: &Value) -> Result<()> {
+    let same = |path: &[&str]| -> bool {
+        let pick = |doc: &Value| {
+            path.iter()
+                .try_fold(doc, |value, key| value.get(*key))
+                .cloned()
+                .unwrap_or(Value::Null)
+        };
+        pick(member) == pick(reference)
+    };
+    ensure!(
+        same(&["_compression", "compression_level"])
+            && same(&["_compression", "compression_method"]),
+        "it uses different compression, so its blocks cannot be copied without re-encoding \
+         them"
+    );
+    ensure!(
+        same(&["_encryption", "enable"])
+            && same(&["_encryption", "aes_type"])
+            && same(&["_encryption", "key_iterations"]),
+        "it uses different encryption, so its blocks cannot be copied without re-encrypting \
+         them"
+    );
+    Ok(())
+}
+
+/// The split continuation files inside the increment range.
+///
+/// Split out from [`check_rules`] so the rule can be tested directly, because no file of the
+/// test corpus is split.
+fn split_in_range(
+    members: impl Iterator<Item = (u16, bool, PathBuf)>,
+    low: u16,
+    high: u16,
+) -> Vec<PathBuf> {
+    members
+        .filter(|(increment, split, _)| *split && *increment >= low && *increment <= high)
+        .map(|(_, _, path)| path)
+        .collect()
 }
 
 #[cfg(test)]
@@ -537,6 +596,109 @@ mod tests {
         let members = vec![(0u16, vec![0u16]), (1, vec![1]), (1, vec![2]), (2, vec![3])];
         let got = closure_over(members.into_iter(), 1, 1);
         assert_eq!(got, absorbed(&[1, 2]));
+    }
+
+    /// A backup file with only the fields the refusal rules read.
+    fn member(imageid: &str, file_number: u16, increment: u16, backup_type: &str) -> BackupFile {
+        let json = serde_json::json!({ "disks": [] });
+        BackupFile {
+            path: PathBuf::from(format!("SET-{file_number:02}-{increment:02}.mrimgx")),
+            size: 0,
+            json_raw: Vec::new(),
+            json,
+            header: crate::json::Header {
+                imageid: imageid.to_string(),
+                file_number,
+                increment_number: increment,
+                merged_files: Vec::new(),
+                split_file: false,
+                index_file_position: 0,
+                delta_index: true,
+                backup_type: backup_type.to_string(),
+            },
+            root_at: 0,
+            root_list: crate::block::BlockList {
+                blocks: Vec::new(),
+                end: 0,
+            },
+            disks: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn each_refusal_uses_the_wording_of_the_original_tool() {
+        let full = member("AAAA0000AAAA0000", 0, 0, "full");
+        let incremental = member("AAAA0000AAAA0000", 1, 1, "inc");
+        let message =
+            |from: &BackupFile, to: &BackupFile| check_pair(from, to).unwrap_err().to_string();
+
+        let other_set = member("BBBB1111BBBB1111", 1, 1, "inc");
+        assert_eq!(
+            message(&full, &other_set),
+            "Error: From and To files are from a different backup set"
+        );
+        assert_eq!(
+            message(&incremental, &full),
+            "Error: From file is more recent than the To file"
+        );
+        let differential = member("AAAA0000AAAA0000", 1, 1, "diff");
+        assert_eq!(
+            message(&differential, &incremental),
+            "Error: From file is a Differential"
+        );
+        assert_eq!(
+            message(&full, &differential),
+            "Error: To file is a Differential"
+        );
+        assert!(message(&full, &full).contains("nothing to merge"));
+        // And a legal pair passes.
+        check_pair(&full, &incremental).unwrap();
+    }
+
+    #[test]
+    fn a_member_whose_compression_or_encryption_differs_is_refused() {
+        let reference = serde_json::json!({
+            "_compression": { "compression_level": "high", "compression_method": "zstd" },
+            "_encryption": { "enable": true, "aes_type": "aes-128", "key_iterations": 600000 }
+        });
+        settings_match(&reference, &reference).unwrap();
+
+        let mut other = reference.clone();
+        other["_compression"]["compression_level"] = serde_json::json!("none");
+        assert!(settings_match(&other, &reference)
+            .unwrap_err()
+            .to_string()
+            .contains("different compression"));
+
+        let mut other = reference.clone();
+        other["_encryption"]["aes_type"] = serde_json::json!("aes-256");
+        assert!(settings_match(&other, &reference)
+            .unwrap_err()
+            .to_string()
+            .contains("different encryption"));
+    }
+
+    #[test]
+    fn a_split_file_in_the_range_is_named() {
+        // A split part shares its parent's increment number. No file of the test corpus is
+        // split, so this rule is tested on its own.
+        let members = || {
+            [
+                (0u16, false, PathBuf::from("SET-00-00.mrimgx")),
+                (1, false, PathBuf::from("SET-01-01.mrimgx")),
+                (1, true, PathBuf::from("SET-02-01.mrimgx")),
+                (2, false, PathBuf::from("SET-03-02.mrimgx")),
+            ]
+            .into_iter()
+        };
+
+        assert_eq!(
+            split_in_range(members(), 0, 2),
+            vec![PathBuf::from("SET-02-01.mrimgx")]
+        );
+        // A range that stops before the split part is clean.
+        assert!(split_in_range(members(), 0, 0).is_empty());
+        assert!(split_in_range(members(), 2, 2).is_empty());
     }
 
     #[test]

@@ -98,10 +98,14 @@ fn consolidate(
         };
     }
 
-    // The set is resolved as of the To file, so discovery starts there.
-    let set = BackupSet::discover(to)?;
+    // The two-file rules run first, so that a From file newer than the To file is reported
+    // in the documented wording rather than as a file missing from the set.
     let from_file = BackupFile::open(from, false)?;
     let to_file = BackupFile::open(to, false)?;
+    plan::check_pair(&from_file, &to_file)?;
+
+    // The set is resolved as of the To file, so discovery starts there.
+    let set = BackupSet::discover(to)?;
     let plan = plan::build(
         &set,
         from_file.header.file_number,

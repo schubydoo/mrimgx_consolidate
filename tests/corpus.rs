@@ -1119,6 +1119,64 @@ fn the_command_writes_a_merge_and_never_touches_a_source() {
     assert!(!blocked_path.exists(), "nothing is written while blocked");
 }
 
+#[test]
+fn every_refusal_exits_non_zero_and_writes_nothing() {
+    let Some(dir) = corpus() else {
+        eprintln!("skipping: testdata/ is absent");
+        return;
+    };
+    let source_dir = dir.join("Backup-Set");
+    let from = source_dir.join("DD5A77E6B68A6C34-Full-00-00.mrimg");
+    let to = source_dir.join("DD5A77E6B68A6C34-Full-01-01.mrimg");
+    if !from.exists() || !to.exists() {
+        eprintln!("skipping: the two-file set is absent");
+        return;
+    }
+    let out_dir = tempfile::tempdir().unwrap();
+    let taken = out_dir.path().join("TAKEN-00-00.mrimg");
+    std::fs::write(&taken, b"a file that is already there").unwrap();
+
+    let refuse = |args: &[&Path]| -> String {
+        let run = std::process::Command::new(env!("CARGO_BIN_EXE_mrimgx-consolidate"))
+            .arg("consolidate")
+            .arg("--from")
+            .arg(args[0])
+            .arg("--to")
+            .arg(args[1])
+            .arg("--out")
+            .arg(args[2])
+            .output()
+            .unwrap();
+        assert!(!run.status.success(), "this run should have been refused");
+        String::from_utf8_lossy(&run.stderr).to_string()
+    };
+
+    // The two files the wrong way round.
+    let out = out_dir.path().join("MERGED-00-00.mrimg");
+    let complaint = refuse(&[&to, &from, &out]);
+    assert!(
+        complaint.contains("From file is more recent than the To file"),
+        "{complaint}"
+    );
+    assert!(!out.exists());
+
+    // An output that names a file of the set.
+    let complaint = refuse(&[&from, &to, &to]);
+    assert!(
+        complaint.contains("is a file of this backup set"),
+        "{complaint}"
+    );
+
+    // An output that is already there.
+    let complaint = refuse(&[&from, &to, &taken]);
+    assert!(complaint.contains("already exists"), "{complaint}");
+    assert_eq!(
+        std::fs::read(&taken).unwrap(),
+        b"a file that is already there",
+        "the file that was there is untouched"
+    );
+}
+
 /// The independent reference extractor, built by `scratch/build-refextract.sh`.
 fn refextract() -> Option<PathBuf> {
     let path = PathBuf::from(std::env::var("REFEXTRACT").unwrap_or("/tmp/refextract".into()));
