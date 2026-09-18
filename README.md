@@ -7,6 +7,12 @@
 
 Consolidate Macrium Reflect X backup sets from Linux, FreeBSD or macOS.
 
+> [!WARNING]
+> **You use this tool at your own risk. The authors accept no responsibility for data loss.
+> Keep a separate, working copy of every backup set before you run `consolidate`.** This is
+> an independent project. Macrium does not make or support it. The software comes with no
+> warranty, as the MIT license states.
+
 Macrium Reflect writes `.mrimgx` backup files. Over time a backup set grows into a Full plus
 a long chain of Incrementals. Merging that chain back into one file is called consolidation,
 and Macrium ships a tool for it that runs only on Windows. If the backup set lives on a
@@ -26,9 +32,13 @@ This tool does the same job on the machine that holds the files.
 It handles uncompressed and compressed sets, AES-encrypted sets, several disks, several
 partitions, and a merge of a file that was merged before.
 
-It refuses four things, and names the reason each time: a split backup set, a set that mixes
-compression or encryption settings, a Differential, and a destination that cannot hold the
-output.
+It refuses five things, and names the reason each time:
+
+- a split backup set
+- a set that mixes compression or encryption settings
+- a Differential as the From or To file
+- an incremental merge across a Differential
+- a destination that cannot hold the output
 
 ## What is proven, and how
 

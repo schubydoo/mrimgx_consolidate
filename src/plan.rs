@@ -431,7 +431,47 @@ fn check_rules(set: &BackupSet, from: &BackupFile, to: &BackupFile) -> Result<()
             .collect::<Vec<_>>()
             .join(", ")
     );
+
+    // An incremental merge writes only the positions that the absorbed delta lists name. A
+    // Differential records its changes in a full index and in no delta list, so a range
+    // that holds one would drop them, and the output would restore the wrong bytes with no
+    // error. A merge from the Full resolves every position and is not affected. Found on a
+    // real Reflect X set on 2026-09-18, where file 5 of eight was a Differential.
+    if !from.header.is_full_index() {
+        if let Some(inside) = full_index_in_range(
+            set.members.iter().map(|m| {
+                (
+                    m.header.increment_number,
+                    m.header.is_full_index(),
+                    m.header.file_number,
+                )
+            }),
+            from.header.increment_number,
+            to.header.increment_number,
+        ) {
+            bail!(
+                "this range holds file {inside}, which is a Differential. An incremental \
+                 merge across it would lose the changes it records. Start the merge after \
+                 file {inside}, or from the Full"
+            );
+        }
+    }
     Ok(())
+}
+
+/// The first member inside the increment range that carries a full index of its own.
+///
+/// Split out from [`check_rules`] so the rule can be tested directly, because no file of the
+/// test corpus is a Differential.
+fn full_index_in_range(
+    members: impl Iterator<Item = (u16, bool, u16)>,
+    low: u16,
+    high: u16,
+) -> Option<u16> {
+    members
+        .filter(|(increment, full, _)| *full && *increment >= low && *increment <= high)
+        .map(|(_, _, file_number)| file_number)
+        .min()
 }
 
 /// The four rules that look only at the two files, in the wording of the original tool.
@@ -703,6 +743,50 @@ mod tests {
         // A range that stops before the split part is clean.
         assert!(split_in_range(members(), 0, 0).is_empty());
         assert!(split_in_range(members(), 2, 2).is_empty());
+    }
+
+    #[test]
+    fn a_differential_inside_an_incremental_range_is_named() {
+        // The shape of a real Reflect X set: a Full, four Incrementals, a Differential at
+        // file 5, and two more Incrementals. Each tuple is (increment, full index, file).
+        let members = || {
+            [
+                (0u16, true, 0u16),
+                (1, false, 1),
+                (2, false, 2),
+                (3, false, 3),
+                (4, false, 4),
+                (5, true, 5),
+                (6, false, 6),
+                (7, false, 7),
+            ]
+            .into_iter()
+        };
+
+        // Every Incremental From before the Differential crosses it.
+        for from in 1..=4 {
+            assert_eq!(
+                full_index_in_range(members(), from, 7),
+                Some(5),
+                "from {from}"
+            );
+        }
+        // A range that starts after the Differential is clean.
+        assert_eq!(full_index_in_range(members(), 6, 7), None);
+        // A range that stops before it is clean.
+        assert_eq!(full_index_in_range(members(), 1, 4), None);
+    }
+
+    #[test]
+    fn the_first_of_two_differentials_is_named() {
+        let members = [
+            (0u16, true, 0u16),
+            (1, false, 1),
+            (2, true, 2),
+            (3, true, 3),
+            (4, false, 4),
+        ];
+        assert_eq!(full_index_in_range(members.into_iter(), 1, 4), Some(2));
     }
 
     #[test]

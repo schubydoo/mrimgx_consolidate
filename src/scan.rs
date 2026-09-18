@@ -24,6 +24,14 @@ pub struct Candidate {
     pub reclaims: u64,
 }
 
+/// One range that a merge refuses, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refused {
+    pub from: u16,
+    pub to: u16,
+    pub reason: String,
+}
+
 /// One backup set, as a scan sees it.
 #[derive(Debug, Clone)]
 pub struct SetReport {
@@ -35,6 +43,9 @@ pub struct SetReport {
     pub bytes: u64,
     /// Ranges worth merging, largest saving first. Empty when there is nothing to gain.
     pub candidates: Vec<Candidate>,
+    /// Ranges that start at a member and cannot be merged, oldest From first, with the
+    /// reason. A range left out with no word reads as an oversight.
+    pub refused: Vec<Refused>,
     /// Why this set cannot be merged, when it cannot.
     pub problem: Option<String>,
 }
@@ -146,6 +157,7 @@ fn report(imageid: &str, newest: &Path) -> SetReport {
         members: 0,
         bytes: 0,
         candidates: Vec::new(),
+        refused: Vec::new(),
         problem: None,
     };
 
@@ -165,8 +177,19 @@ fn report(imageid: &str, newest: &Path) -> SetReport {
         return out;
     }
 
+    // Every member older than the newest can start a range. A number with no member of its
+    // own, which retention deleted or a merge absorbed, cannot.
+    let mut starts: Vec<u16> = set
+        .members
+        .iter()
+        .map(|m| m.header.file_number)
+        .filter(|n| *n < last)
+        .collect();
+    starts.sort_unstable();
+    starts.dedup();
+
     let mut refusal = None;
-    for from in 0..last {
+    for from in starts {
         match plan::build(&set, from, last) {
             Ok(plan) => {
                 let absorbed: u64 = plan
@@ -183,10 +206,16 @@ fn report(imageid: &str, newest: &Path) -> SetReport {
                     reclaims: absorbed.saturating_sub(plan.projected_size()),
                 });
             }
-            // Every range of a set fails for the same reason, so the first one is the
-            // reason the set cannot be merged at all.
+            // When every range fails, the first reason is the reason the set cannot be
+            // merged at all.
             Err(error) => {
-                refusal.get_or_insert(format!("{error:#}"));
+                let reason = format!("{error:#}");
+                refusal.get_or_insert(reason.clone());
+                out.refused.push(Refused {
+                    from,
+                    to: last,
+                    reason,
+                });
             }
         }
     }

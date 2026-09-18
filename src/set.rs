@@ -9,7 +9,7 @@
 //! flattening mirrors `buildIndex` and `mapDeltaToFullIndex`, both in
 //! `src/libs/file_reader/backup_set.cpp`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
 use anyhow::{bail, ensure, Context, Result};
@@ -128,15 +128,45 @@ impl BackupSet {
         Ok(&self.members[self.base_index()?])
     }
 
-    /// Make sure that the file numbers form a gapless run from zero.
+    /// Make sure that every file a restore of the newest member reads is present.
     ///
-    /// A missing middle file leaves the chain unresolvable, and the failure would
-    /// otherwise appear much later as a block that points at a file nobody has.
+    /// Those are the base, which is the newest member with a full index of its own, every
+    /// file that index names, and every file after the base. A missing file after the base
+    /// leaves the chain unresolvable, and the failure would otherwise appear much later as a
+    /// block that points at a file nobody has.
+    ///
+    /// A gap below the base is normal. Reflect's retention deletes the Incrementals that a
+    /// later Differential made unnecessary, so a healthy set can hold only a Full, two
+    /// Differentials and the Incrementals after the newer one. Measured on a real Reflect X
+    /// set on 2026-09-18: files 0, 13, 18 and 22, where 22 had absorbed 19 to 21.
     fn check_complete(&self) -> Result<()> {
-        let highest = self.members[0].header.file_number;
-        let missing: Vec<u16> = (0..=highest)
-            .filter(|n| !self.owners.contains_key(n))
-            .collect();
+        let base = &self.members[self.base_index()?];
+        let mut referenced = Vec::new();
+        for disk in &base.disks {
+            for part in &disk.partitions {
+                if let Blocks::Full(entries) = &part.index.blocks {
+                    referenced.extend(
+                        entries
+                            .iter()
+                            .filter(|e| !e.is_hole())
+                            .map(|e| e.file_number),
+                    );
+                }
+                referenced.extend(
+                    part.index
+                        .reserved
+                        .iter()
+                        .filter(|e| !e.is_hole())
+                        .map(|e| e.file_number),
+                );
+            }
+        }
+        let missing = missing_file_numbers(
+            |n| self.owners.contains_key(&n),
+            base.header.file_number,
+            self.members[0].header.file_number,
+            referenced,
+        );
         if !missing.is_empty() {
             bail!(
                 "Backup set is not complete. At least one file may be missing. \
@@ -283,6 +313,22 @@ impl Flattened {
     }
 }
 
+/// The file numbers a restore needs that no member claims, in ascending order.
+///
+/// A restore needs every number from the base through the newest member, and every number
+/// the base index names. Split out from [`BackupSet::check_complete`] so the rule can be
+/// tested directly, because no set of the test corpus has a Differential.
+fn missing_file_numbers(
+    owned: impl Fn(u16) -> bool,
+    base: u16,
+    newest: u16,
+    referenced: impl IntoIterator<Item = u16>,
+) -> Vec<u16> {
+    let mut needed: BTreeSet<u16> = (base..=newest).collect();
+    needed.extend(referenced);
+    needed.into_iter().filter(|n| !owned(*n)).collect()
+}
+
 fn format_skipped(skipped: &[String]) -> String {
     if skipped.is_empty() {
         return String::new();
@@ -328,5 +374,35 @@ mod tests {
         assert_eq!(counts.get(&0), Some(&2));
         assert_eq!(counts.get(&2), Some(&1));
         assert_eq!(counts.len(), 2);
+    }
+
+    fn owned_by(numbers: &[u16]) -> impl Fn(u16) -> bool + '_ {
+        move |n| numbers.contains(&n)
+    }
+
+    #[test]
+    fn a_retention_gap_below_a_differential_is_complete() {
+        // The real set: files 0, 13 and 18 on disk, 22 absorbed 19 to 21, and 18 is the
+        // Differential the restore starts from. Its index names only 0 and 18.
+        let owned = [0, 13, 18, 19, 20, 21, 22];
+        let missing = missing_file_numbers(owned_by(&owned), 18, 22, [0, 18, 0, 18]);
+        assert!(missing.is_empty(), "{missing:?}");
+    }
+
+    #[test]
+    fn a_missing_incremental_after_the_base_is_reported() {
+        let owned = [0, 1, 3];
+        assert_eq!(missing_file_numbers(owned_by(&owned), 0, 3, [0]), vec![2]);
+    }
+
+    #[test]
+    fn a_missing_full_that_the_differential_names_is_reported() {
+        // The Differential still points at blocks of file 0, so the set cannot restore
+        // without it, even though every number from the base up is present.
+        let owned = [13, 14];
+        assert_eq!(
+            missing_file_numbers(owned_by(&owned), 13, 14, [0, 13]),
+            vec![0]
+        );
     }
 }
