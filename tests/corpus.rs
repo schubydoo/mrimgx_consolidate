@@ -1606,6 +1606,42 @@ fn a_file_that_does_not_parse_is_listed_and_the_scan_carries_on() {
 }
 
 #[test]
+fn a_missing_incremental_after_the_base_is_still_refused() {
+    // The completeness rule no longer asks for every number from zero, because retention
+    // leaves gaps below a Differential. A gap after the base is still a broken chain, and
+    // this proves the new rule still catches it on real files.
+    let Some(dir) = corpus() else {
+        eprintln!("skipping: testdata/ is absent");
+        return;
+    };
+    let source_dir = dir.join("Backup-Set-MP");
+    let name = |n: &str| format!("584221F3840B0DBE-MP-Full-{n}.mrimg");
+    if !source_dir.join(name("03-03")).exists() {
+        eprintln!("skipping: the multi-partition set is absent");
+        return;
+    }
+
+    let work = tempfile::tempdir().unwrap();
+    for part in ["00-00", "01-01", "03-03"] {
+        std::fs::copy(source_dir.join(name(part)), work.path().join(name(part))).unwrap();
+    }
+
+    let error = BackupSet::discover(work.path().join(name("03-03"))).unwrap_err();
+    let message = format!("{error:#}");
+    assert!(message.contains("Backup set is not complete"), "{message}");
+    assert!(message.contains("claims file number 2)"), "{message}");
+
+    // With every file present, the same set is complete.
+    std::fs::copy(
+        source_dir.join(name("02-02")),
+        work.path().join(name("02-02")),
+    )
+    .unwrap();
+    let set = BackupSet::discover(work.path().join(name("03-03"))).unwrap();
+    assert_eq!(set.members.len(), 4);
+}
+
+#[test]
 fn a_merge_of_a_middle_range_says_which_files_it_could_not_bring_up_to_date() {
     // Files above the To file are not part of the set the plan saw, and this tool will not
     // write to them. They still record the names of the files the merge absorbs, so a run

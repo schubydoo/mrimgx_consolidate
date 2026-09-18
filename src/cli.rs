@@ -219,6 +219,11 @@ fn scan(directory: &Path, json: bool) -> Result<()> {
                     "moves": c.moves,
                     "reclaims": c.reclaims,
                 })).collect::<Vec<_>>(),
+                "refused": set.refused.iter().map(|r| serde_json::json!({
+                    "from": r.from,
+                    "to": r.to,
+                    "reason": r.reason,
+                })).collect::<Vec<_>>(),
             })).collect::<Vec<_>>(),
             "skipped": found.skipped.iter().map(|s| serde_json::json!({
                 "path": s.path.display().to_string(),
@@ -264,6 +269,12 @@ fn scan(directory: &Path, json: bool) -> Result<()> {
             println!(
                 "    files {} through {}  {kind:<18} moves {} bytes, reclaims {} bytes",
                 candidate.from, candidate.to, candidate.moves, candidate.reclaims
+            );
+        }
+        for refused in &set.refused {
+            println!(
+                "    files {} through {}  {:<18} {}",
+                refused.from, refused.to, "refused", refused.reason
             );
         }
     }
