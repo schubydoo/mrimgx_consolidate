@@ -58,12 +58,18 @@ pub enum Command {
         /// Delete the files the output absorbed, once the output has been read back.
         #[arg(long)]
         delete_merged: bool,
+        /// Report as JSON, so a scheduled job can act on it.
+        #[arg(long)]
+        json: bool,
     },
     /// Report which backup sets in a directory can be consolidated, and what that saves.
     Scan {
         /// The directory to look in.
         #[arg(value_name = "DIRECTORY")]
         directory: PathBuf,
+        /// Report as JSON, so a scheduled job can act on it.
+        #[arg(long)]
+        json: bool,
     },
     /// Resolve a backup set and report where every logical block lives.
     Resolve {
@@ -79,7 +85,7 @@ pub enum Command {
 pub fn run() -> Result<()> {
     match Cli::parse().command {
         Command::Inspect { files } => inspect(&files),
-        Command::Scan { directory } => scan(&directory),
+        Command::Scan { directory, json } => scan(&directory, json),
         Command::Resolve { file, blocks } => resolve(&file, blocks),
         Command::Consolidate {
             from,
@@ -89,6 +95,7 @@ pub fn run() -> Result<()> {
             recover,
             verify_md5,
             delete_merged,
+            json,
         } => consolidate(
             &from,
             &to,
@@ -97,6 +104,7 @@ pub fn run() -> Result<()> {
             recover,
             verify_md5,
             delete_merged,
+            json,
         ),
     }
 }
@@ -109,6 +117,7 @@ fn consolidate(
     recover: bool,
     verify_md5: bool,
     delete_merged: bool,
+    json: bool,
 ) -> Result<()> {
     if recover {
         let directory = out
@@ -141,19 +150,75 @@ fn consolidate(
         to_file.header.file_number,
     )?;
 
-    print_plan(&set, &plan);
+    // In JSON, a run that writes reports one document at the end, with the plan inside it.
+    // Two documents on one stream would not parse.
+    if !json {
+        print_plan(&set, &plan);
+    } else if dry_run {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&plan_as_json(&set, &plan))?
+        );
+    }
 
     if dry_run {
         return Ok(());
     }
     let out = out
         .context("give --out FILE to write the merge, or --dry-run to report what it would move")?;
-    write_merge(&set, &plan, out, verify_md5, delete_merged)
+    write_merge(&set, &plan, out, verify_md5, delete_merged, json)
+}
+
+/// The plan as a document, carrying the same numbers the text form prints.
+fn plan_as_json(set: &BackupSet, plan: &plan::MergePlan) -> serde_json::Value {
+    serde_json::json!({
+        "imageid": set.newest().header.imageid,
+        "from": plan.from,
+        "to": plan.to,
+        "kind": plan.kind.consolidation_type(),
+        "absorbs": plan.redundant_file_numbers(),
+        "out_file_number": plan.out_file_number,
+        "out_increment_number": plan.out_increment_number,
+        "blocks_to_copy": plan.blocks_to_copy(),
+        "bytes_to_copy": plan.bytes_to_copy(),
+        "blocks_kept": plan.blocks_kept(),
+        "holes": plan.holes(),
+        "projected_size": plan.projected_size(),
+        "redundant_files": plan.redundant_file_numbers().iter()
+            .filter_map(|n| set.owner(*n).map(|f| f.path.display().to_string()))
+            .collect::<Vec<_>>(),
+    })
 }
 
 /// Report every backup set in a directory and what merging it would save.
-fn scan(directory: &Path) -> Result<()> {
+fn scan(directory: &Path, json: bool) -> Result<()> {
     let found = scanner::scan(directory)?;
+
+    if json {
+        let document = serde_json::json!({
+            "directory": directory.display().to_string(),
+            "sets": found.sets.iter().map(|set| serde_json::json!({
+                "imageid": set.imageid,
+                "newest": set.newest.display().to_string(),
+                "members": set.members,
+                "bytes": set.bytes,
+                "problem": set.problem,
+                "candidates": set.candidates.iter().map(|c| serde_json::json!({
+                    "from": c.from,
+                    "to": c.to,
+                    "kind": c.kind.consolidation_type(),
+                    "moves": c.moves,
+                    "reclaims": c.reclaims,
+                })).collect::<Vec<_>>(),
+            })).collect::<Vec<_>>(),
+            "skipped": found.skipped.iter().map(|s| serde_json::json!({
+                "path": s.path.display().to_string(),
+                "reason": s.reason,
+            })).collect::<Vec<_>>(),
+        });
+        println!("{}", serde_json::to_string_pretty(&document)?);
+        return Ok(());
+    }
 
     if found.sets.is_empty() {
         println!("no backup set in {}", directory.display());
@@ -207,6 +272,7 @@ fn write_merge(
     out: &Path,
     verify_md5: bool,
     delete_merged: bool,
+    json: bool,
 ) -> Result<()> {
     for member in &set.members {
         ensure!(
@@ -229,23 +295,20 @@ fn write_merge(
 
     // Classified before anything is written, because it decides what a rename is worth.
     let mount = commit::Mount::of(directory);
-    println!();
-    println!("destination      {} on {}", out.display(), mount.describe());
-    for caveat in mount.caveats() {
-        println!("  note           {caveat}");
-    }
+    // Everything the run wants to say, collected so that the text form and the JSON form
+    // carry the same words.
+    let mut notes: Vec<String> = mount.caveats();
 
     // Refuse now rather than forty gigabytes in.
     let free = commit::check_free_space(directory, plan.projected_size())?;
-    println!("  free space       {free} bytes");
 
-    let note = format!(
+    let held = format!(
         "merging files {} through {}\noutput {}",
         plan.from,
         plan.to,
         out.display()
     );
-    let _lock = commit::Lock::take(directory, &note)?;
+    let _lock = commit::Lock::take(directory, &held)?;
 
     let mut source = write::SourceFiles::open(set, plan)?;
     let mut temp = commit::TempOutput::create(out)?;
@@ -253,8 +316,9 @@ fn write_merge(
     if let Some(model) = set.owner(plan.to) {
         temp.take_permissions_from(&model.path)?;
     }
-    if temp.reserve(plan.projected_size()) == commit::Reservation::Unsupported {
-        println!("  note           this file system does not reserve space in advance");
+    let reserved = temp.reserve(plan.projected_size());
+    if reserved == commit::Reservation::Unsupported {
+        notes.push("this file system does not reserve space in advance".to_string());
     }
     let written = {
         let mut writer = BufWriter::new(temp.writer());
@@ -263,54 +327,95 @@ fn write_merge(
         written
     };
     let committed = temp.commit(&mount, written.size)?;
+    if committed.flush_downgraded {
+        notes.push("the strong flush is not supported here, so a weaker one was used".to_string());
+    }
+    if committed.rename_retries > 0 {
+        notes.push(format!(
+            "the rename needed {} retries",
+            committed.rename_retries
+        ));
+    }
+    if committed.rename_error_was_wrong {
+        notes.push("the rename reported an error for work it had already done".to_string());
+    }
 
     // Over a network mount only one confirmation is worth trusting: re-open the output and
     // read it back.
     write::check_output(out, plan)?;
 
-    println!();
-    println!("wrote {} ({} bytes)", out.display(), written.size);
-    println!("  read back and checked against the plan");
-    if committed.flush_downgraded {
-        println!("  the strong flush is not supported here, so a weaker one was used");
-    }
-    if committed.rename_retries > 0 {
-        println!("  the rename needed {} retries", committed.rename_retries);
-    }
-    if committed.rename_error_was_wrong {
-        println!("  the rename reported an error for work it had already done");
-    }
-    if verify_md5 {
+    let verified = if verify_md5 {
         // The password never comes from the command line, because arguments show up in the
         // process list.
         let password = std::env::var("MRIMGX_PASSWORD").ok();
-        let verified = verify::verify_file(out, password.as_deref())?;
+        Some(verify::verify_file(out, password.as_deref())?)
+    } else {
+        None
+    };
+
+    // Only now, after the output was read back, may a source be removed. A rename that
+    // returned success is not enough, because on a network mount it does not prove much.
+    let redundant = redundant_paths(set, plan);
+    if delete_merged {
+        for path in &redundant {
+            std::fs::remove_file(path).with_context(|| format!("deleting {}", path.display()))?;
+        }
+    }
+
+    if json {
+        let document = serde_json::json!({
+            "plan": plan_as_json(set, plan),
+            "output": out.display().to_string(),
+            "bytes": written.size,
+            "index_file_position": written.data.end,
+            "destination": mount.describe(),
+            "free_space": free,
+            "space_reserved": reserved == commit::Reservation::Made,
+            "read_back": true,
+            "verified": verified.as_ref().map(|v| serde_json::json!({
+                "blocks": v.blocks,
+                "bytes": v.bytes,
+                "not_tested": v.elsewhere,
+            })),
+            "deleted": delete_merged,
+            "redundant_files": redundant.iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>(),
+            "notes": notes,
+        });
+        println!("{}", serde_json::to_string_pretty(&document)?);
+        return Ok(());
+    }
+
+    println!();
+    println!("destination      {} on {}", out.display(), mount.describe());
+    println!("  free space     {free} bytes");
+    println!("wrote {} ({} bytes)", out.display(), written.size);
+    println!("  read back and checked against the plan");
+    for note in &notes {
+        println!("  note           {note}");
+    }
+    if let Some(verified) = &verified {
         println!(
-            "  verified         {} blocks, {} bytes of plaintext, every hash matched",
+            "  verified       {} blocks, {} bytes of plaintext, every hash matched",
             verified.blocks, verified.bytes
         );
         if verified.elsewhere > 0 {
             println!(
-                "  not tested       {} blocks that still live in another file of the set",
+                "  not tested     {} blocks that still live in another file of the set",
                 verified.elsewhere
             );
         }
     }
-    // Only now, after the output was read back, may a source be removed. A rename that
-    // returned success is not enough, because on a network mount it does not prove much.
     if delete_merged {
-        println!("  deleting the files the output absorbed, oldest first:");
-        for path in redundant_paths(set, plan) {
-            std::fs::remove_file(&path).with_context(|| format!("deleting {}", path.display()))?;
-            println!("    deleted  {}", path.display());
-        }
+        println!("  deleted the files the output absorbed, oldest first:");
     } else {
         println!("  these files are now redundant:");
-        for number in plan.redundant_file_numbers() {
-            if let Some(owner) = set.owner(number) {
-                println!("    file {number:>3}  {}", owner.path.display());
-            }
-        }
+    }
+    for path in &redundant {
+        println!("    {}", path.display());
+    }
+    if !delete_merged {
         println!("  nothing was deleted. Pass --delete-merged to remove them");
     }
     Ok(())

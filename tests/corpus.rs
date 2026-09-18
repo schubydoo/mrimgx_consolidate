@@ -1572,6 +1572,123 @@ fn a_file_that_does_not_parse_is_listed_and_the_scan_carries_on() {
 }
 
 #[test]
+fn the_json_form_parses_and_carries_the_numbers_the_text_form_prints() {
+    let Some(dir) = corpus() else {
+        eprintln!("skipping: testdata/ is absent");
+        return;
+    };
+    let source_dir = dir.join("Backup-Set");
+    let from = source_dir.join("DD5A77E6B68A6C34-Full-00-00.mrimg");
+    let to = source_dir.join("DD5A77E6B68A6C34-Full-01-01.mrimg");
+    if !to.exists() {
+        eprintln!("skipping: the two-file set is absent");
+        return;
+    }
+
+    let run = |args: &[&str], extra: &[&Path]| -> (bool, String) {
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_mrimgx-consolidate"));
+        command.args(args);
+        for path in extra {
+            command.arg(path);
+        }
+        let done = command.output().unwrap();
+        (
+            done.status.success(),
+            String::from_utf8_lossy(&done.stdout).to_string(),
+        )
+    };
+
+    // A scan, as text and as JSON.
+    let (ok, text) = run(&["scan"], &[&source_dir]);
+    assert!(ok);
+    let (ok, raw) = run(&["scan", "--json"], &[&source_dir]);
+    assert!(ok);
+    let scanned: serde_json::Value = serde_json::from_str(&raw).expect("scan --json parses");
+    let set = &scanned["sets"][0];
+    assert_eq!(set["imageid"], "DD5A77E6B68A6C34");
+    assert_eq!(set["members"], 2);
+    // The same numbers appear in the text form.
+    assert!(text.contains(set["bytes"].as_u64().unwrap().to_string().as_str()));
+    let candidate = &set["candidates"][0];
+    assert_eq!(candidate["kind"], "synthetic_full");
+    assert!(text.contains(candidate["moves"].as_u64().unwrap().to_string().as_str()));
+
+    // A dry run, as text and as JSON.
+    let plan_args = ["consolidate", "--dry-run", "--from"];
+    let (ok, text) = run(&plan_args, &[&from]);
+    assert!(!ok, "--to is required");
+    let (ok, text_plan) = run(
+        &[
+            "consolidate",
+            "--dry-run",
+            "--from",
+            from.to_str().unwrap(),
+            "--to",
+        ],
+        &[&to],
+    );
+    assert!(ok, "{text}");
+    let (ok, raw) = run(
+        &[
+            "consolidate",
+            "--dry-run",
+            "--json",
+            "--from",
+            from.to_str().unwrap(),
+            "--to",
+        ],
+        &[&to],
+    );
+    assert!(ok);
+    let planned: serde_json::Value = serde_json::from_str(&raw).expect("consolidate --json parses");
+    assert_eq!(planned["kind"], "synthetic_full");
+    assert_eq!(planned["blocks_to_copy"], 237);
+    assert_eq!(planned["bytes_to_copy"], 15_532_032u64);
+    assert!(text_plan.contains("237"));
+    assert!(text_plan.contains("15532032"));
+
+    // A real run reports one document, not two.
+    let out_dir = tempfile::tempdir().unwrap();
+    let merged = out_dir.path().join("MERGED-00-00.mrimg");
+    let (ok, raw) = run(
+        &[
+            "consolidate",
+            "--json",
+            "--from",
+            from.to_str().unwrap(),
+            "--to",
+            to.to_str().unwrap(),
+            "--out",
+        ],
+        &[&merged],
+    );
+    assert!(ok);
+    let done: serde_json::Value = serde_json::from_str(&raw).expect("one document, not two");
+    assert_eq!(done["output"], merged.display().to_string());
+    assert_eq!(done["read_back"], true);
+    assert_eq!(done["deleted"], false);
+    assert_eq!(done["plan"]["blocks_to_copy"], 237);
+    assert_eq!(
+        done["bytes"].as_u64().unwrap(),
+        std::fs::metadata(&merged).unwrap().len()
+    );
+
+    // And a refusal exits non-zero and prints no document.
+    let (ok, raw) = run(
+        &[
+            "consolidate",
+            "--json",
+            "--from",
+            to.to_str().unwrap(),
+            "--to",
+        ],
+        &[&from],
+    );
+    assert!(!ok, "the files the wrong way round must be refused");
+    assert!(raw.trim().is_empty(), "{raw}");
+}
+
+#[test]
 fn nothing_is_deleted_without_the_flag_and_everything_absorbed_is_deleted_with_it() {
     let Some(dir) = corpus() else {
         eprintln!("skipping: testdata/ is absent");
