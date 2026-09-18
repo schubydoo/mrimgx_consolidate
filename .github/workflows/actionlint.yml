@@ -1,0 +1,51 @@
+name: Actionlint
+
+# Lints the workflow files: YAML schema, the types inside `${{ }}`, and, through
+# shellcheck, the shell in every `run:` block. It runs on every pull request and on
+# push to main with no `paths:` filter, because actionlint over this tree takes
+# seconds. A paths-filtered check that is also required hangs a non-workflow pull
+# request at "Expected, waiting for status", so always-on keeps it safe to require.
+
+on:
+  pull_request:
+    # The explicit list is the implicit default plus ready_for_review, which fires
+    # again on the draft to ready flip.
+    types: [opened, synchronize, reopened, ready_for_review]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: actionlint-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  actionlint:
+    name: actionlint
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install and run actionlint (version and checksum pinned)
+        env:
+          # renovate: datasource=github-releases depName=rhysd/actionlint
+          ACTIONLINT_VERSION: "1.7.12"
+          # sha256 of actionlint_1.7.12_linux_amd64.tar.gz from the release checksums.
+          # Renovate can bump the pair. A moved artifact fails the -c.
+          ACTIONLINT_SHA256: "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8"
+        run: |
+          set -euo pipefail
+          url="https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          curl -fsSL "$url" -o actionlint.tar.gz
+          echo "${ACTIONLINT_SHA256}  actionlint.tar.gz" | sha256sum -c -
+          tar -xzf actionlint.tar.gz actionlint
+          # The shellcheck binary ships on ubuntu-latest. Fail loudly if that changes,
+          # so a run: block never goes unlinted. (This comment does not start with the
+          # tool name, which reads as an SC directive and errors SC1072.)
+          shellcheck --version >/dev/null \
+            || { echo "::error::shellcheck missing, so run: blocks would go unlinted"; exit 1; }
+          ./actionlint -color
