@@ -1,6 +1,6 @@
 [package]
 name = "mrimgx-consolidate"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.96"
 description = "Consolidate Macrium Reflect X backup sets on Linux, FreeBSD and macOS"

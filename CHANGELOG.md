@@ -4,6 +4,41 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 knope writes each entry from the files in `.changeset/` at the release.
 
+## 0.1.1 (2026-09-18)
+
+### Features
+
+#### `scan --recursive` scans every folder below a path ([#5](https://github.com/schubydoo/mrimgx_consolidate/pull/5))
+
+`scan --recursive` (or `-r`) runs the scan in the folder you name and in every folder below
+it. The text form prints only the folders that hold a backup file. A total line follows: the
+number of sets, how many can be merged, and the bytes the best merge of each reclaims. The
+`--json` form lists every folder.
+
+The walk does not follow links to folders, so a link loop cannot trap it. It does not enter
+the snapshot folders `.zfs`, `.snapshot` and `#snapshot`, which hold copies of the same sets.
+A folder that cannot be listed is reported as skipped, and the walk carries on.
+
+### Fixes
+
+#### Refuse an incremental merge across a Differential, and accept retention gaps ([#4](https://github.com/schubydoo/mrimgx_consolidate/pull/4))
+
+An incremental merge whose range held a Differential dropped the changes that only the
+Differential records. The merged file then restored the wrong bytes and reported no error. The
+tool now refuses that range and names the Differential. A merge from the Full was never
+affected, because it resolves every block. Do not use version 0.1.0 for an incremental merge
+of a set that holds a Differential.
+
+A set that Reflect's retention thinned out, for example a Full, two Differentials and the
+Incrementals after the newer one, was reported as not complete. The check now asks for the
+files a restore actually reads: the newest Full or Differential, every file its index names,
+and every file after it.
+
+`scan` now lists every range it refuses, with the reason, instead of leaving it out.
+
+The README now carries a warning: keep a separate copy of every backup set before you run
+`consolidate`.
+
 ## 0.1.0 (2026-09-18)
 
 ### Features
