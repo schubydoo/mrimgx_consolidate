@@ -1473,6 +1473,71 @@ fn the_compressed_and_the_encrypted_sets_merge_whole() {
 }
 
 #[test]
+fn nothing_is_deleted_without_the_flag_and_everything_absorbed_is_deleted_with_it() {
+    let Some(dir) = corpus() else {
+        eprintln!("skipping: testdata/ is absent");
+        return;
+    };
+    let source_dir = dir.join("Backup-Set-MP");
+    let name = |n: u16| format!("584221F3840B0DBE-MP-Full-{n:02}-{n:02}.mrimg");
+    if !source_dir.join(name(2)).exists() {
+        eprintln!("skipping: the multi-partition set is absent");
+        return;
+    }
+
+    // Copies, because this test deletes what it is given.
+    let work = tempfile::tempdir().unwrap();
+    for number in 0..=2 {
+        std::fs::copy(
+            source_dir.join(name(number)),
+            work.path().join(name(number)),
+        )
+        .unwrap();
+    }
+    let member = |n: u16| work.path().join(name(n));
+
+    // Without the flag the sources stay and the run says which are redundant. The output
+    // goes to its own directory: a merged file left beside the files it absorbed makes two
+    // members claim one file number, which the reader refuses.
+    let elsewhere = tempfile::tempdir().unwrap();
+    let quiet = elsewhere.path().join("MERGED-KEEP.mrimg");
+    merge(&member(0), &member(2), &quiet);
+    assert!(member(0).exists() && member(1).exists() && member(2).exists());
+
+    let with_flag = work.path().join("MERGED-DELETE.mrimg");
+    let run = std::process::Command::new(env!("CARGO_BIN_EXE_mrimgx-consolidate"))
+        .arg("consolidate")
+        .arg("--from")
+        .arg(member(0))
+        .arg("--to")
+        .arg(member(2))
+        .arg("--out")
+        .arg(&with_flag)
+        .arg("--delete-merged")
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    // Every absorbed file is gone, and the output is not.
+    for number in 0..=2 {
+        assert!(!member(number).exists(), "file {number} should be deleted");
+    }
+    assert!(with_flag.is_file(), "the output survives");
+    assert!(quiet.is_file(), "the earlier output was left alone");
+
+    // The report names them oldest first, which is the order they were removed in.
+    let report = String::from_utf8_lossy(&run.stdout);
+    let order: Vec<usize> = (0..=2)
+        .map(|n| report.find(&name(n as u16)).expect("each file is named"))
+        .collect();
+    assert!(order[0] < order[1] && order[1] < order[2], "{report}");
+}
+
+#[test]
 fn the_end_to_end_test_hashes_every_block_of_an_uncompressed_output() {
     // The reference restore tests md5_hash only when compression is on, so an uncompressed
     // set gets no integrity test from it at all. This one tests every block.

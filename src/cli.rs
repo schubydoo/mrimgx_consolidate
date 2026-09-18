@@ -54,6 +54,9 @@ pub enum Command {
         /// MRIMGX_PASSWORD.
         #[arg(long)]
         verify_md5: bool,
+        /// Delete the files the output absorbed, once the output has been read back.
+        #[arg(long)]
+        delete_merged: bool,
     },
     /// Resolve a backup set and report where every logical block lives.
     Resolve {
@@ -77,7 +80,16 @@ pub fn run() -> Result<()> {
             dry_run,
             recover,
             verify_md5,
-        } => consolidate(&from, &to, out.as_deref(), dry_run, recover, verify_md5),
+            delete_merged,
+        } => consolidate(
+            &from,
+            &to,
+            out.as_deref(),
+            dry_run,
+            recover,
+            verify_md5,
+            delete_merged,
+        ),
     }
 }
 
@@ -88,6 +100,7 @@ fn consolidate(
     dry_run: bool,
     recover: bool,
     verify_md5: bool,
+    delete_merged: bool,
 ) -> Result<()> {
     if recover {
         let directory = out
@@ -127,7 +140,7 @@ fn consolidate(
     }
     let out = out
         .context("give --out FILE to write the merge, or --dry-run to report what it would move")?;
-    write_merge(&set, &plan, out, verify_md5)
+    write_merge(&set, &plan, out, verify_md5, delete_merged)
 }
 
 /// Write the merge, commit it, and read it back.
@@ -136,6 +149,7 @@ fn write_merge(
     plan: &plan::MergePlan,
     out: &Path,
     verify_md5: bool,
+    delete_merged: bool,
 ) -> Result<()> {
     for member in &set.members {
         ensure!(
@@ -225,14 +239,40 @@ fn write_merge(
             );
         }
     }
-    println!("  these files are now redundant:");
+    // Only now, after the output was read back, may a source be removed. A rename that
+    // returned success is not enough, because on a network mount it does not prove much.
+    if delete_merged {
+        println!("  deleting the files the output absorbed, oldest first:");
+        for path in redundant_paths(set, plan) {
+            std::fs::remove_file(&path).with_context(|| format!("deleting {}", path.display()))?;
+            println!("    deleted  {}", path.display());
+        }
+    } else {
+        println!("  these files are now redundant:");
+        for number in plan.redundant_file_numbers() {
+            if let Some(owner) = set.owner(number) {
+                println!("    file {number:>3}  {}", owner.path.display());
+            }
+        }
+        println!("  nothing was deleted. Pass --delete-merged to remove them");
+    }
+    Ok(())
+}
+
+/// The files the output makes redundant, in ascending file number order.
+///
+/// One file can answer for several numbers, because a member that was consolidated before
+/// claims every number it absorbed. Each path is listed once.
+fn redundant_paths(set: &BackupSet, plan: &plan::MergePlan) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = Vec::new();
     for number in plan.redundant_file_numbers() {
         if let Some(owner) = set.owner(number) {
-            println!("    file {number:>3}  {}", owner.path.display());
+            if !paths.contains(&owner.path) {
+                paths.push(owner.path.clone());
+            }
         }
     }
-    println!("  nothing was deleted. This tool never removes a source file");
-    Ok(())
+    paths
 }
 
 /// Whether two paths name the same file, decided before the second one exists.

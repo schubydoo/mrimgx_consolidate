@@ -86,9 +86,21 @@ impl BackupSet {
 
         members.sort_by_key(|m| std::cmp::Reverse(m.header.file_number));
 
-        let mut owners = HashMap::new();
+        let mut owners: HashMap<u16, usize> = HashMap::new();
         for (i, member) in members.iter().enumerate() {
             for number in member.header.owned_file_numbers() {
+                // Two files claiming one number is what a directory looks like when a
+                // merged output was left beside the files it absorbed. Which one holds the
+                // bytes is then a guess, so refuse rather than guess.
+                if let Some(other) = owners.get(&number) {
+                    bail!(
+                        "{} and {} both claim file number {number} of set {}. \
+                         Move or delete the file the other one absorbed",
+                        members[*other].path.display(),
+                        member.path.display(),
+                        target.header.imageid
+                    );
+                }
                 owners.insert(number, i);
             }
         }
