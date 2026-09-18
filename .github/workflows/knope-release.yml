@@ -219,6 +219,11 @@ jobs:
       - name: Build inside a FreeBSD virtual machine
         uses: vmactions/freebsd-vm@4469451fe39bee80be4066836c5170362e9349f3 # v1.5.7
         with:
+          # A FreeBSD binary runs on its own release and on later ones, never on an
+          # earlier one. The default image is the newest release, whose binary a
+          # FreeBSD 14 machine refuses. Building on 14.3 covers 14.3 and later,
+          # including 15.
+          release: "14.3"
           usesh: true
           copyback: true
           prepare: |
