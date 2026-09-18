@@ -100,25 +100,34 @@ pub fn run() -> Result<()> {
             &from,
             &to,
             out.as_deref(),
-            dry_run,
-            recover,
-            verify_md5,
-            delete_merged,
-            json,
+            Options {
+                dry_run,
+                recover,
+                verify_md5,
+                delete_merged,
+                json,
+            },
         ),
     }
 }
 
-fn consolidate(
-    from: &Path,
-    to: &Path,
-    out: Option<&Path>,
+/// What a consolidate run was asked to do, beyond naming the two files.
+#[derive(Debug, Clone, Copy)]
+struct Options {
     dry_run: bool,
     recover: bool,
     verify_md5: bool,
     delete_merged: bool,
     json: bool,
-) -> Result<()> {
+}
+
+fn consolidate(from: &Path, to: &Path, out: Option<&Path>, options: Options) -> Result<()> {
+    let Options {
+        dry_run,
+        recover,
+        json,
+        ..
+    } = options;
     if recover {
         let directory = out
             .or(Some(to))
@@ -166,7 +175,7 @@ fn consolidate(
     }
     let out = out
         .context("give --out FILE to write the merge, or --dry-run to report what it would move")?;
-    write_merge(&set, &plan, out, verify_md5, delete_merged, json)
+    write_merge(&set, &plan, out, options)
 }
 
 /// The plan as a document, carrying the same numbers the text form prints.
@@ -270,10 +279,14 @@ fn write_merge(
     set: &BackupSet,
     plan: &plan::MergePlan,
     out: &Path,
-    verify_md5: bool,
-    delete_merged: bool,
-    json: bool,
+    options: Options,
 ) -> Result<()> {
+    let Options {
+        verify_md5,
+        delete_merged,
+        json,
+        ..
+    } = options;
     for member in &set.members {
         ensure!(
             !is_same_file(&member.path, out),
