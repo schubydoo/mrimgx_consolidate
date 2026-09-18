@@ -12,6 +12,7 @@
 
 pub mod block;
 pub mod cli;
+pub mod commit;
 pub mod index;
 pub mod json;
 pub mod plan;

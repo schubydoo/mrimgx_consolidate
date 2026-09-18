@@ -1,15 +1,18 @@
 //! Command line surface.
 
-use std::path::PathBuf;
+use std::io::{BufWriter, Write};
+use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{ensure, Context, Result};
 use clap::{Parser, Subcommand};
 
+use crate::commit;
 use crate::index::Blocks;
 use crate::json;
 use crate::plan::{self, MergeKind};
 use crate::reader::BackupFile;
 use crate::set::BackupSet;
+use crate::write;
 
 #[derive(Parser, Debug)]
 #[command(name = "mrimgx-consolidate", version, about, long_about = None)]
@@ -28,9 +31,7 @@ pub enum Command {
         #[arg(required = true, value_name = "FILE")]
         files: Vec<PathBuf>,
     },
-    /// Report what merging a range of a backup set moves.
-    ///
-    /// Only `--dry-run` works today. The writer is not implemented yet.
+    /// Merge a range of a backup set into one file.
     Consolidate {
         /// The first file of the range. Usually the Full.
         #[arg(long, value_name = "FILE")]
@@ -38,9 +39,15 @@ pub enum Command {
         /// The last file of the range. It must be the newest file of the set.
         #[arg(long, value_name = "FILE")]
         to: PathBuf,
+        /// Where to write the merged file. Required unless `--dry-run` is given.
+        #[arg(long, value_name = "FILE")]
+        out: Option<PathBuf>,
         /// Report the plan and write nothing.
         #[arg(long)]
         dry_run: bool,
+        /// Clear a lock left behind by a killed run, then stop.
+        #[arg(long)]
+        recover: bool,
     },
     /// Resolve a backup set and report where every logical block lives.
     Resolve {
@@ -57,11 +64,40 @@ pub fn run() -> Result<()> {
     match Cli::parse().command {
         Command::Inspect { files } => inspect(&files),
         Command::Resolve { file, blocks } => resolve(&file, blocks),
-        Command::Consolidate { from, to, dry_run } => consolidate(&from, &to, dry_run),
+        Command::Consolidate {
+            from,
+            to,
+            out,
+            dry_run,
+            recover,
+        } => consolidate(&from, &to, out.as_deref(), dry_run, recover),
     }
 }
 
-fn consolidate(from: &PathBuf, to: &PathBuf, dry_run: bool) -> Result<()> {
+fn consolidate(
+    from: &Path,
+    to: &Path,
+    out: Option<&Path>,
+    dry_run: bool,
+    recover: bool,
+) -> Result<()> {
+    if recover {
+        let directory = out
+            .or(Some(to))
+            .and_then(Path::parent)
+            .unwrap_or(Path::new("."));
+        return match commit::Lock::clear(directory)? {
+            true => {
+                println!("cleared the lock in {}", directory.display());
+                Ok(())
+            }
+            false => {
+                println!("no lock in {}", directory.display());
+                Ok(())
+            }
+        };
+    }
+
     // The set is resolved as of the To file, so discovery starts there.
     let set = BackupSet::discover(to)?;
     let from_file = BackupFile::open(from, false)?;
@@ -74,13 +110,84 @@ fn consolidate(from: &PathBuf, to: &PathBuf, dry_run: bool) -> Result<()> {
 
     print_plan(&set, &plan);
 
-    if !dry_run {
-        anyhow::bail!(
-            "the writer is not implemented yet, so only --dry-run works. \
-             The plan above is what a merge would move."
+    if dry_run {
+        return Ok(());
+    }
+    let out = out
+        .context("give --out FILE to write the merge, or --dry-run to report what it would move")?;
+    write_merge(&set, &plan, out)
+}
+
+/// Write the merge, commit it, and read it back.
+fn write_merge(set: &BackupSet, plan: &plan::MergePlan, out: &Path) -> Result<()> {
+    for member in &set.members {
+        ensure!(
+            !is_same_file(&member.path, out),
+            "the output path {} is a file of this backup set. \
+             A merge never writes over a file it reads",
+            out.display()
         );
     }
+    ensure!(
+        !out.exists(),
+        "{} already exists. This tool never writes over a file that is there",
+        out.display()
+    );
+    let name = out
+        .file_name()
+        .and_then(|name| name.to_str())
+        .with_context(|| format!("{} has no usable file name", out.display()))?;
+    let directory = out.parent().unwrap_or(Path::new("."));
+
+    let note = format!(
+        "merging files {} through {}\noutput {}",
+        plan.from,
+        plan.to,
+        out.display()
+    );
+    let _lock = commit::Lock::take(directory, &note)?;
+
+    let mut source = write::SourceFiles::open(set, plan)?;
+    let mut temp = commit::TempOutput::create(out)?;
+    // The output replaces the files it absorbs, so it carries their permissions.
+    if let Some(model) = set.owner(plan.to) {
+        temp.take_permissions_from(&model.path)?;
+    }
+    let written = {
+        let mut writer = BufWriter::new(temp.writer());
+        let written = write::write_output(set, plan, &mut source, &mut writer, name)?;
+        writer.flush()?;
+        written
+    };
+    temp.commit()?;
+
+    // Over a network mount only one confirmation is worth trusting: re-open the output and
+    // read it back.
+    write::check_output(out, plan)?;
+
+    println!();
+    println!("wrote {} ({} bytes)", out.display(), written.size);
+    println!("  read back and checked against the plan");
+    println!("  these files are now redundant:");
+    for number in plan.redundant_file_numbers() {
+        if let Some(owner) = set.owner(number) {
+            println!("    file {number:>3}  {}", owner.path.display());
+        }
+    }
+    println!("  nothing was deleted. This tool never removes a source file");
     Ok(())
+}
+
+/// Whether two paths name the same file, decided before the second one exists.
+fn is_same_file(existing: &Path, planned: &Path) -> bool {
+    let resolved = |path: &Path| -> Option<PathBuf> {
+        let parent = path.parent().unwrap_or(Path::new("."));
+        Some(parent.canonicalize().ok()?.join(path.file_name()?))
+    };
+    match (resolved(existing), resolved(planned)) {
+        (Some(a), Some(b)) => a == b,
+        _ => existing == planned,
+    }
 }
 
 fn print_plan(set: &BackupSet, plan: &plan::MergePlan) {

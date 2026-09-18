@@ -1035,6 +1035,90 @@ fn an_incremental_merge_keeps_the_full_and_still_resolves() {
     assert_eq!(per_file[&3], 43 + 27 + 45);
 }
 
+#[test]
+fn the_command_writes_a_merge_and_never_touches_a_source() {
+    // The commit sequence through the shipped command: lock, temporary file, rename, then
+    // the read-back. Every source must come out of it byte for byte as it went in.
+    let Some(dir) = corpus() else {
+        eprintln!("skipping: testdata/ is absent");
+        return;
+    };
+    let source_dir = dir.join("Backup-Set");
+    let from = source_dir.join("DD5A77E6B68A6C34-Full-00-00.mrimg");
+    let to = source_dir.join("DD5A77E6B68A6C34-Full-01-01.mrimg");
+    if !from.exists() || !to.exists() {
+        eprintln!("skipping: the two-file set is absent");
+        return;
+    }
+
+    let before: Vec<Vec<u8>> = [&from, &to]
+        .iter()
+        .map(|path| std::fs::read(path).unwrap())
+        .collect();
+
+    let out_dir = tempfile::tempdir().unwrap();
+    let out_path = out_dir.path().join("MERGED-00-00.mrimg");
+    let run = std::process::Command::new(env!("CARGO_BIN_EXE_mrimgx-consolidate"))
+        .args(["consolidate", "--from"])
+        .arg(&from)
+        .arg("--to")
+        .arg(&to)
+        .arg("--out")
+        .arg(&out_path)
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "the merge failed: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    assert!(out_path.is_file(), "the output is in place");
+    let report = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        report.contains("read back and checked against the plan"),
+        "{report}"
+    );
+    assert!(report.contains("nothing was deleted"), "{report}");
+
+    // The lock is released on the way out, so a second merge can run.
+    assert!(!out_dir.path().join("merge_running").exists());
+
+    let after: Vec<Vec<u8>> = [&from, &to]
+        .iter()
+        .map(|path| std::fs::read(path).unwrap())
+        .collect();
+    assert_eq!(before, after, "a source file changed during the merge");
+
+    // A lock left by another run stops the next one, and says what holds it.
+    std::fs::write(
+        out_dir.path().join("merge_running"),
+        "pid 1\nstarted 0\nmerging files 0 through 1\n",
+    )
+    .unwrap();
+    let blocked_path = out_dir.path().join("SECOND-00-00.mrimg");
+    let blocked = std::process::Command::new(env!("CARGO_BIN_EXE_mrimgx-consolidate"))
+        .args(["consolidate", "--from"])
+        .arg(&from)
+        .arg("--to")
+        .arg(&to)
+        .arg("--out")
+        .arg(&blocked_path)
+        .output()
+        .unwrap();
+    assert!(!blocked.status.success(), "a held lock must stop the run");
+    let complaint = String::from_utf8_lossy(&blocked.stderr);
+    assert!(
+        complaint.contains("another merge holds the lock"),
+        "{complaint}"
+    );
+    assert!(
+        complaint.contains("merging files 0 through 1"),
+        "{complaint}"
+    );
+    assert!(!blocked_path.exists(), "nothing is written while blocked");
+}
+
 /// The independent reference extractor, built by `scratch/build-refextract.sh`.
 fn refextract() -> Option<PathBuf> {
     let path = PathBuf::from(std::env::var("REFEXTRACT").unwrap_or("/tmp/refextract".into()));

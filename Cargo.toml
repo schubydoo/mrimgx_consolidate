@@ -34,8 +34,11 @@ md-5 = "0.11"
 # blocks and for the optional end-to-end verify.
 zstd = "0.14"
 
-[dev-dependencies]
+# Temporary file naming only. The output is written under a random name in the destination
+# directory, so two runs cannot collide and the rename into place stays on one file system.
 tempfile = "3"
+
+[dev-dependencies]
 serde_json = "1"
 
 [profile.release]
