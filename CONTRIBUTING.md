@@ -74,6 +74,43 @@ on macOS" is easier to trust than one that stays quiet.
 Expect review to ask for evidence. "It works" is not evidence. The output of the test you
 added is.
 
+A change that a user can see also needs a changeset, which is a short file in `.changeset/`
+that becomes its changelog entry. Run `knope document-change` to write one. A test, a refactor
+or a documentation fix needs none. The file looks like this:
+
+```markdown
+---
+default: minor
+---
+
+#### `scan --json` reports the reclaimed bytes per candidate
+
+The JSON form of `scan` now carries `reclaims` for each candidate.
+```
+
+Use `major` for a change that breaks a documented behavior, `minor` for a new capability, and
+`patch` for a fix. The release takes the largest bump among the pending files.
+
+## Releases
+
+A maintainer cuts a release in three steps:
+
+1. Run `gh workflow run knope-release.yml` to rehearse the build and the signing without a publish.
+2. On an up-to-date `main`, run `GITHUB_TOKEN=$(gh auth token) knope prepare-release`.
+3. Review and merge the `chore: prepare release X.Y.Z` pull request that it opens.
+
+For the first release, add `--override-version 0.1.0` to step 2. Without a previous tag, knope
+bumps the version in `Cargo.toml` past it.
+
+The first step bumps the version from the pending changesets, writes `CHANGELOG.md`, and opens
+the pull request from a branch named `release`. It runs locally because a pull request opened by
+the workflow token starts no workflow run, so continuous integration never reports on it.
+
+The merge starts `.github/workflows/knope-release.yml`. It builds static Linux binaries for
+amd64 and arm64, macOS binaries for arm64 and x86_64, and a FreeBSD amd64 binary. It then signs
+the checksums with cosign, attaches SLSA build provenance, and publishes the GitHub release with
+every asset attached. A missing asset stops the run before anything is tagged.
+
 ## Style
 
 `cargo fmt` decides formatting. `cargo clippy --all-targets -- -D warnings` has to pass.
