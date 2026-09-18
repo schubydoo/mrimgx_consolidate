@@ -416,6 +416,11 @@ fn patch_header(doc: &mut Value, plan: &MergePlan, index_file_position: u64) -> 
     header.insert("delta_index".into(), plan.kind.delta_index().into());
     // The output is one file. A split continuation is refused before the write starts.
     header.insert("split_file".into(), false.into());
+    // The name of the machine that took the backup, for example DESKTOP-EXAMPLE. The tool
+    // that wrote the output did not run there, so the key is kept and its value is cleared.
+    if header.contains_key("netbios_name") {
+        header.insert("netbios_name".into(), "".into());
+    }
     if plan.kind == MergeKind::SyntheticFull {
         // The output carries a complete index, so it is a Full whatever the backup
         // definition called the To file.
@@ -999,6 +1004,7 @@ mod tests {
                 "imageid": "DD5A77E6B68A6C34",
                 "increment_number": 1,
                 "index_file_position": 4096,
+                "netbios_name": "DESKTOP-EXAMPLE",
                 "split_file": false
             },
             "disks": [{
@@ -1043,6 +1049,8 @@ mod tests {
         assert_eq!(header["delta_index"], false);
         assert_eq!(header["split_file"], false);
         assert_eq!(header["backup_type"], "full");
+        // The machine that took the backup is not the machine that wrote this file.
+        assert_eq!(header["netbios_name"], "");
     }
 
     #[test]

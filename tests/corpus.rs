@@ -827,6 +827,8 @@ fn patching_a_real_document_records_the_merge_and_leaks_no_path() {
     assert_eq!(doc["_header"]["index_file_position"], 16_777_216u64);
     assert_eq!(doc["_header"]["delta_index"], false);
     assert_eq!(doc["_header"]["backup_type"], "full");
+    assert_ne!(before["_header"]["netbios_name"], "");
+    assert_eq!(doc["_header"]["netbios_name"], "");
     assert_eq!(
         doc["_auxiliary_data"]["backup_definition"]["consolidation_type"],
         "synthetic_full"
