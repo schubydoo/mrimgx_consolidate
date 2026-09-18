@@ -1,0 +1,350 @@
+name: Knope Release
+
+# The publish half of a release. A maintainer runs `knope prepare-release` locally,
+# which opens the `chore: prepare release X.Y.Z` pull request from the `release`
+# branch. When that pull request merges, this workflow builds the release binaries
+# for Linux, macOS and FreeBSD, writes a CycloneDX software bill of materials from
+# Cargo.lock, signs the checksums with cosign, attaches SLSA build provenance, and
+# stages the whole signed set into dist/release-assets/. Only then does
+# `knope release` run. With `assets` set in knope.toml it creates the GitHub release
+# as a draft, uploads every asset, and publishes, which is when the tag is created.
+#
+# The gate before the publish step fails closed. A missing tarball, signature or
+# provenance bundle aborts the run before anything is tagged or published, so a
+# half-built release never reaches a user.
+#
+# To make sure of a published asset:
+#   gh attestation verify <tarball> --repo schubydoo/mrimgx_consolidate
+#   sha256sum -c checksums.txt
+#   cosign verify-blob checksums.txt --bundle checksums.txt.sigstore.json \
+#     --certificate-identity-regexp '^https://github\.com/schubydoo/mrimgx_consolidate/\.github/workflows/knope-release\.yml@' \
+#     --certificate-oidc-issuer https://token.actions.githubusercontent.com
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+  # A manual run builds, signs and stages everything, then uploads the staged set as a
+  # workflow artifact and stops. That is the rehearsal for a release. With `publish`
+  # set, from main, once Cargo.toml holds the version, it is the fallback for a merge
+  # whose run failed.
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish the GitHub release. Leave off for a rehearsal."
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: knope-release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    name: Build ${{ matrix.name }} binary
+    if: >-
+      ${{ (github.event_name == 'pull_request'
+           && github.event.pull_request.merged == true
+           && github.head_ref == 'release')
+          || (github.event_name == 'workflow_dispatch'
+              && (github.ref == 'refs/heads/main' || !inputs.publish)) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            name: linux-amd64
+          - target: aarch64-unknown-linux-musl
+            name: linux-arm64
+    steps:
+      # The squash commit that landed on main carries the bumped Cargo.toml, and its
+      # version names the tarball.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha || github.sha }}
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          toolchain: stable
+          target: ${{ matrix.target }}
+          cache: false
+          # A stray warning must not fail a release build.
+          rustflags: ""
+          build-warnings: warn
+      # zig is the cross linker for both musl targets, and it builds the C sources of
+      # zstd as well.
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          # renovate: datasource=github-releases depName=ziglang/zig
+          version: 0.15.1
+          use-cache: false
+      - uses: taiki-e/install-action@76c2e6406e52637deed7160d77bded76bd83e06e # v2.87.14
+        with:
+          tool: cargo-zigbuild@0.23.0
+      - name: Build (static musl through zig)
+        run: cargo zigbuild --release --locked --target ${{ matrix.target }} --bin mrimgx-consolidate
+      - name: Assert the binary is static
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          bin="target/${TARGET}/release/mrimgx-consolidate"
+          file "$bin"
+          # A static binary has no PT_INTERP, which is the dynamic loader. That holds
+          # for a classic static binary and for a static position independent one,
+          # where `file` prints different words.
+          if readelf -l "$bin" | grep -q 'INTERP'; then
+            echo "::error::the musl build has a dynamic loader segment, so it is not static"
+            exit 1
+          fi
+      - name: Package tarball
+        env:
+          NAME: ${{ matrix.name }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          version="$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)"
+          case "$version" in
+            [0-9]*.[0-9]*.[0-9]*) : ;;
+            *) echo "::error::could not read the package version from Cargo.toml (got '${version}')"; exit 1 ;;
+          esac
+          pkg="mrimgx-consolidate-v${version}-${NAME}"
+          mkdir -p "dist/${pkg}"
+          cp "target/${TARGET}/release/mrimgx-consolidate" "dist/${pkg}/mrimgx-consolidate"
+          cp LICENSE README.md "dist/${pkg}/"
+          tar -C dist -czf "dist/${pkg}.tar.gz" "${pkg}"
+      - name: Upload tarball artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist-${{ matrix.name }}
+          path: dist/mrimgx-consolidate-*-${{ matrix.name }}.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
+  macos:
+    name: Build ${{ matrix.name }} binary
+    if: >-
+      ${{ (github.event_name == 'pull_request'
+           && github.event.pull_request.merged == true
+           && github.head_ref == 'release')
+          || (github.event_name == 'workflow_dispatch'
+              && (github.ref == 'refs/heads/main' || !inputs.publish)) }}
+    runs-on: macos-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            name: macos-arm64
+          - target: x86_64-apple-darwin
+            name: macos-x86_64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha || github.sha }}
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          toolchain: stable
+          target: ${{ matrix.target }}
+          cache: false
+          rustflags: ""
+          build-warnings: warn
+      # The runner is an arm64 machine with the macOS software development kit, which
+      # carries both architectures, so the x86_64 build is a plain cross build.
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }} --bin mrimgx-consolidate
+      - name: Package tarball
+        env:
+          NAME: ${{ matrix.name }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          version="$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)"
+          case "$version" in
+            [0-9]*.[0-9]*.[0-9]*) : ;;
+            *) echo "::error::could not read the package version from Cargo.toml (got '${version}')"; exit 1 ;;
+          esac
+          pkg="mrimgx-consolidate-v${version}-${NAME}"
+          mkdir -p "dist/${pkg}"
+          cp "target/${TARGET}/release/mrimgx-consolidate" "dist/${pkg}/mrimgx-consolidate"
+          cp LICENSE README.md "dist/${pkg}/"
+          tar -C dist -czf "dist/${pkg}.tar.gz" "${pkg}"
+      - name: Upload tarball artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist-${{ matrix.name }}
+          path: dist/mrimgx-consolidate-*-${{ matrix.name }}.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
+  freebsd:
+    name: Build freebsd-amd64 binary
+    if: >-
+      ${{ (github.event_name == 'pull_request'
+           && github.event.pull_request.merged == true
+           && github.head_ref == 'release')
+          || (github.event_name == 'workflow_dispatch'
+              && (github.ref == 'refs/heads/main' || !inputs.publish)) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha || github.sha }}
+          persist-credentials: false
+      # FreeBSD has no cross linker on a GitHub runner, and the zstd dependency needs
+      # a C compiler with a FreeBSD system root. A virtual machine builds it natively
+      # instead, which is slower and honest.
+      - name: Build inside a FreeBSD virtual machine
+        uses: vmactions/freebsd-vm@4469451fe39bee80be4066836c5170362e9349f3 # v1.5.7
+        with:
+          usesh: true
+          copyback: true
+          prepare: |
+            pkg install -y rustup-init
+            rustup-init -y --profile minimal --default-toolchain stable
+          run: |
+            set -e
+            . "$HOME/.cargo/env"
+            cargo build --release --locked --bin mrimgx-consolidate
+            version="$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)"
+            pkg="mrimgx-consolidate-v${version}-freebsd-amd64"
+            mkdir -p "dist/${pkg}"
+            cp target/release/mrimgx-consolidate "dist/${pkg}/mrimgx-consolidate"
+            cp LICENSE README.md "dist/${pkg}/"
+            tar -C dist -czf "dist/${pkg}.tar.gz" "${pkg}"
+      - name: Assert the tarball came back
+        run: |
+          set -euo pipefail
+          count=$(find dist -name 'mrimgx-consolidate-*-freebsd-amd64.tar.gz' | wc -l)
+          [ "$count" -eq 1 ] || { echo "::error::the FreeBSD build produced ${count} tarballs"; exit 1; }
+      - name: Upload tarball artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist-freebsd-amd64
+          path: dist/mrimgx-consolidate-*-freebsd-amd64.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    name: Sign, attest and publish
+    needs: [linux, macos, freebsd]
+    if: ${{ needs.linux.result == 'success' && needs.macos.result == 'success' && needs.freebsd.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write # knope creates the tag and the release
+      id-token: write # cosign keyless signing and the provenance attestation
+      attestations: write
+    steps:
+      # knope must tag a commit that is on main, which is the squash commit, not the
+      # pull request head. Full history and tags, so knope can compare the bumped
+      # version against the last tag.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Fetch the built tarballs
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: artifacts
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: Install syft
+        uses: anchore/sbom-action/download-syft@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+      - name: Assemble, checksum and sign
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          find artifacts -name 'mrimgx-consolidate-*.tar.gz' -exec cp {} release/ \;
+          count=$(find release -name 'mrimgx-consolidate-*.tar.gz' | wc -l)
+          [ "$count" -eq 5 ] || { echo "::error::expected 5 tarballs, found ${count}"; exit 1; }
+          version="$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)"
+          case "$version" in
+            [0-9]*.[0-9]*.[0-9]*) : ;;
+            *) echo "::error::could not read the package version from Cargo.toml (got '${version}')"; exit 1 ;;
+          esac
+          # The bill of materials comes from Cargo.lock, not from a binary scan. The
+          # lockfile is the faithful record and it covers every architecture at once.
+          syft scan file:Cargo.lock -o "cyclonedx-json=release/mrimgx-consolidate-v${version}.cdx.json"
+          # syft exits 0 even when it found nothing, so assert that the file has
+          # components before it ships.
+          components=$(jq '.components | length' "release/mrimgx-consolidate-v${version}.cdx.json")
+          [ "${components:-0}" -gt 0 ] || { echo "::error::the bill of materials has no components"; exit 1; }
+          cd release
+          sha256sum mrimgx-consolidate-*.tar.gz mrimgx-consolidate-*.cdx.json > checksums.txt
+          # One keyless signature over checksums.txt covers every file through its hash.
+          cosign sign-blob --bundle checksums.txt.sigstore.json checksums.txt --yes
+          # Read back what was just signed. A bundle cosign cannot read would ship
+          # green and surface later as a user report.
+          cosign verify-blob checksums.txt \
+            --bundle checksums.txt.sigstore.json \
+            --certificate-identity-regexp "^https://github\.com/${GITHUB_REPOSITORY}/\.github/workflows/knope-release\.yml@" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com
+      - name: SLSA build provenance
+        id: provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-checksums: release/checksums.txt
+      - name: Stage the assets, and fail closed on a gap
+        env:
+          BUNDLE: ${{ steps.provenance.outputs.bundle-path }}
+        run: |
+          set -euo pipefail
+          [ -s "$BUNDLE" ] || { echo "::error::no provenance bundle was produced"; exit 1; }
+          cp "$BUNDLE" release/mrimgx-consolidate.intoto.jsonl
+          mkdir -p dist/release-assets
+          cp release/mrimgx-consolidate-*.tar.gz \
+             release/mrimgx-consolidate-*.cdx.json \
+             release/checksums.txt \
+             release/checksums.txt.sigstore.json \
+             release/mrimgx-consolidate.intoto.jsonl \
+             dist/release-assets/
+          tarballs=$(find dist/release-assets -name 'mrimgx-consolidate-*.tar.gz' | wc -l)
+          [ "$tarballs" -eq 5 ] || { echo "::error::expected 5 staged tarballs, found ${tarballs}"; exit 1; }
+          sboms=$(find dist/release-assets -name 'mrimgx-consolidate-*.cdx.json' | wc -l)
+          [ "$sboms" -eq 1 ] || { echo "::error::expected 1 staged bill of materials, found ${sboms}"; exit 1; }
+          for f in checksums.txt checksums.txt.sigstore.json mrimgx-consolidate.intoto.jsonl; do
+            [ -s "dist/release-assets/${f}" ] || { echo "::error::the staged asset ${f} is missing"; exit 1; }
+          done
+          echo "staged $(find dist/release-assets -type f | wc -l) assets"
+      # A rehearsal ends here, with the staged set kept for inspection.
+      - name: Upload the staged set (rehearsal)
+        if: ${{ github.event_name == 'workflow_dispatch' && !inputs.publish }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-assets
+          path: dist/release-assets/
+          if-no-files-found: error
+          retention-days: 7
+      - name: Install knope
+        if: ${{ github.event_name == 'pull_request' || inputs.publish }}
+        uses: knope-dev/action@19617851f9f13ab2f27a05989c55efb18aca3675 # v2.1.2
+        with:
+          # renovate: datasource=github-releases depName=knope-dev/knope extractVersion=^knope/v(?<version>.+)$
+          version: 0.23.0
+      # knope creates the draft, uploads dist/release-assets/*, and publishes, which
+      # is when the tag appears. It does nothing when the version already has a
+      # release, so a re-run after a good publish is safe.
+      - name: Create and publish the GitHub release
+        if: ${{ github.event_name == 'pull_request' || inputs.publish }}
+        run: knope release --verbose
+        env:
+          GITHUB_TOKEN: ${{ github.token }}

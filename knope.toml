@@ -1,0 +1,100 @@
+# Release automation with knope, using the changeset model.
+#
+# Every user-facing change ships a `.changeset/*.md` fragment. Those fragments, not
+# commit messages, drive both the version bump and the changelog.
+# `knope document-change` writes one. See CONTRIBUTING.md.
+#
+# The two halves of a release:
+#
+#   1. A maintainer runs `knope prepare-release` locally, which bumps the version and
+#      the changelog on a branch named `release`, then opens a pull request. This half
+#      is local on purpose. A pull request opened by the built-in token does not start
+#      a workflow run, so continuous integration would never report on it, and branch
+#      protection would never let it merge.
+#   2. Merging that pull request starts .github/workflows/knope-release.yml, which
+#      builds and signs the release artifacts, stages them, and then runs
+#      `knope release`.
+#
+# With `assets` set below, the Release step creates the GitHub release as a draft,
+# uploads every asset, and only then publishes it. The tag is created at publish, so
+# the release locks with its assets already attached.
+
+[package]
+# Single crate. The pattern is anchored to the start of a line, so it rewrites the
+# [package] version and never a dependency pin.
+versioned_files = [
+  { path = "Cargo.toml", regex = '(?m)^version = "(?<version>\d+\.\d+\.\d+)"' },
+]
+changelog = "CHANGELOG.md"
+
+# knope-release.yml stages the signed set here before `knope release` runs. A gate in
+# that workflow asserts the set is complete first, because knope fails only on a
+# globbed file that vanished, never on one that was never built.
+assets = "dist/release-assets/*"
+
+extra_changelog_sections = [
+  { name = "Security", types = ["security"] },
+  { name = "Performance", types = ["perf"] },
+]
+
+[changes]
+ignore_conventional_commits = true
+
+[github]
+owner = "schubydoo"
+repo = "mrimgx_consolidate"
+
+[release_notes]
+change_templates = [
+  "### $summary ([#$pr_number](https://github.com/schubydoo/mrimgx_consolidate/pull/$pr_number))\n\n$details",
+  "### $summary\n\n$details",
+  "- $summary ([#$pr_number](https://github.com/schubydoo/mrimgx_consolidate/pull/$pr_number))",
+  "- $summary",
+]
+
+# --- prepare-release: bump the version and open the release pull request ------
+[[workflows]]
+name = "prepare-release"
+
+[[workflows.steps]]
+type = "Command"
+command = "git switch -C release"
+
+[[workflows.steps]]
+type = "PrepareRelease"
+
+[[workflows.steps]]
+type = "Command"
+command = "cargo update --workspace"
+
+[[workflows.steps]]
+type = "Command"
+command = 'git commit -am "chore: prepare release $version"'
+
+[[workflows.steps]]
+type = "Command"
+command = "git push --force --set-upstream origin release"
+
+[[workflows.steps]]
+type = "CreatePullRequest"
+base = "main"
+
+[workflows.steps.title]
+template = "chore: prepare release $version"
+
+[workflows.steps.body]
+template = "Merging this pull request tags and publishes **v$version**.\n\nknope generated it from the `.changeset/*.md` fragments. Do not edit it by hand.\n\n---\n\n$changelog"
+
+# --- release: create the tag and the GitHub release on merge ------------------
+[[workflows]]
+name = "release"
+
+[[workflows.steps]]
+type = "Release"
+
+# --- document-change: write a new changeset fragment --------------------------
+[[workflows]]
+name = "document-change"
+
+[[workflows.steps]]
+type = "CreateChangeFile"
