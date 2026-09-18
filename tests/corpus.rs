@@ -1572,6 +1572,77 @@ fn a_file_that_does_not_parse_is_listed_and_the_scan_carries_on() {
 }
 
 #[test]
+fn a_merge_of_a_middle_range_says_which_files_it_could_not_bring_up_to_date() {
+    // Files above the To file are not part of the set the plan saw, and this tool will not
+    // write to them. They still record the names of the files the merge absorbs, so a run
+    // says so rather than leaving it to be discovered later.
+    let Some(dir) = corpus() else {
+        eprintln!("skipping: testdata/ is absent");
+        return;
+    };
+    let source_dir = dir.join("Backup-Set-MP");
+    let name = |n: u16| format!("584221F3840B0DBE-MP-Full-{n:02}-{n:02}.mrimg");
+    if !source_dir.join(name(3)).exists() {
+        eprintln!("skipping: the multi-partition set is absent");
+        return;
+    }
+
+    let out_dir = tempfile::tempdir().unwrap();
+    let merged = out_dir.path().join("MERGED-00-00.mrimg");
+    let run = std::process::Command::new(env!("CARGO_BIN_EXE_mrimgx-consolidate"))
+        .arg("consolidate")
+        .arg("--json")
+        .arg("--from")
+        .arg(source_dir.join(name(0)))
+        .arg("--to")
+        .arg(source_dir.join(name(2)))
+        .arg("--out")
+        .arg(&merged)
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let done: serde_json::Value = serde_json::from_slice(&run.stdout).unwrap();
+    let notes = done["notes"].as_array().unwrap();
+    let about_later = notes
+        .iter()
+        .filter(|note| note.as_str().unwrap().contains("is newer than the range"))
+        .count();
+    assert_eq!(
+        about_later, 1,
+        "file 3 is the one above the range: {notes:?}"
+    );
+    assert!(notes
+        .iter()
+        .any(|note| note.as_str().unwrap().contains(&name(3))));
+
+    // A merge that ends at the newest file has nothing above it to report.
+    let whole = out_dir.path().join("WHOLE-00-00.mrimg");
+    let run = std::process::Command::new(env!("CARGO_BIN_EXE_mrimgx-consolidate"))
+        .arg("consolidate")
+        .arg("--json")
+        .arg("--from")
+        .arg(source_dir.join(name(0)))
+        .arg("--to")
+        .arg(source_dir.join(name(3)))
+        .arg("--out")
+        .arg(&whole)
+        .output()
+        .unwrap();
+    assert!(run.status.success());
+    let done: serde_json::Value = serde_json::from_slice(&run.stdout).unwrap();
+    assert!(done["notes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|note| !note.as_str().unwrap().contains("is newer than the range")));
+}
+
+#[test]
 fn the_json_form_parses_and_carries_the_numbers_the_text_form_prints() {
     let Some(dir) = corpus() else {
         eprintln!("skipping: testdata/ is absent");

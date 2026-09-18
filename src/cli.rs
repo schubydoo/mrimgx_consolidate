@@ -312,6 +312,25 @@ fn write_merge(
     // carry the same words.
     let mut notes: Vec<String> = mount.caveats();
 
+    // A file newer than the To file is not part of this set, so the plan never saw it. It
+    // keeps its own record of which file held each block, and this tool will not write to it
+    // to bring that up to date. Reflect finds the members of a set by scanning the
+    // directory, so it resolves either way. A reader that follows the recorded names instead
+    // will not, once the absorbed files are gone.
+    let newest = set.newest();
+    let above = scanner::members_above(
+        newest.path.parent().unwrap_or(Path::new(".")),
+        &newest.header.imageid,
+        newest.header.increment_number,
+    );
+    for path in &above {
+        notes.push(format!(
+            "{} is newer than the range and still records the names of the files this merge \
+             absorbs",
+            path.display()
+        ));
+    }
+
     // Refuse now rather than forty gigabytes in.
     commit::check_file_size_limit(&mount, plan.projected_size())?;
     let free = commit::check_free_space(directory, plan.projected_size())?;

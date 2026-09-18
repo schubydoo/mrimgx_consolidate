@@ -56,6 +56,36 @@ pub struct Scan {
 /// The extensions a backup file carries.
 const EXTENSIONS: &[&str] = &["mrimg", "mrimgx"];
 
+/// Members of the same set that sit above `increment`, which a merge does not see.
+///
+/// A set is discovered as of the To file, so a file newer than it is not a member and the
+/// plan never looks at it. Those files keep their own record of which file held each block,
+/// and a merge cannot update it without writing to them. This finds them so a run can say
+/// so.
+pub fn members_above(directory: &Path, imageid: &str, increment: u16) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_backup = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()));
+        if !is_backup {
+            continue;
+        }
+        if let Ok(file) = BackupFile::open(&path, false) {
+            if file.header.imageid == imageid && file.header.increment_number > increment {
+                found.push(path);
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
 /// Report every backup set in `directory`.
 pub fn scan(directory: &Path) -> Result<Scan> {
     let mut newest: BTreeMap<String, BackupFile> = BTreeMap::new();
