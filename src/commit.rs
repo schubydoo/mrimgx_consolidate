@@ -12,7 +12,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::process;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 
@@ -89,6 +89,149 @@ impl Drop for Lock {
     }
 }
 
+/// File system types that are network mounts.
+const REMOTE: &[&str] = &[
+    "9p",
+    "afs",
+    "beegfs",
+    "ceph",
+    "cifs",
+    "davfs",
+    "fuse.glusterfs",
+    "fuse.s3fs",
+    "fuse.sshfs",
+    "glusterfs",
+    "lustre",
+    "ncpfs",
+    "nfs",
+    "nfs4",
+    "smb2",
+    "smb3",
+    "smbfs",
+];
+
+/// File system types that are local disks.
+const LOCAL: &[&str] = &[
+    "apfs", "bcachefs", "btrfs", "exfat", "ext2", "ext3", "ext4", "f2fs", "hfs", "hfsplus", "jfs",
+    "msdos", "ntfs", "ntfs3", "overlay", "reiserfs", "tmpfs", "ufs", "vfat", "xfs", "zfs",
+];
+
+/// What kind of file system the destination sits on.
+///
+/// This decides how much a successful rename is worth. On a local disk it is the whole
+/// guarantee. On a network mount it is one report among several, and the read-back is what
+/// the safety rests on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Mount {
+    Local {
+        file_system: String,
+    },
+    Remote {
+        file_system: String,
+    },
+    /// The type could not be read. Treated as a network mount, because that is the careful
+    /// side of the guess.
+    Unknown,
+}
+
+impl Mount {
+    /// Classify the file system that holds `directory`.
+    pub fn of(directory: &Path) -> Self {
+        let Ok(mountinfo) = std::fs::read_to_string("/proc/self/mountinfo") else {
+            // Every platform but Linux, where this file does not exist.
+            return Mount::Unknown;
+        };
+        let Ok(resolved) = directory.canonicalize() else {
+            return Mount::Unknown;
+        };
+        match file_system_of(&mountinfo, &resolved) {
+            Some(file_system) => Mount::classify(&file_system),
+            None => Mount::Unknown,
+        }
+    }
+
+    fn classify(file_system: &str) -> Self {
+        if REMOTE.contains(&file_system) {
+            return Mount::Remote {
+                file_system: file_system.to_string(),
+            };
+        }
+        if LOCAL.contains(&file_system) {
+            return Mount::Local {
+                file_system: file_system.to_string(),
+            };
+        }
+        Mount::Unknown
+    }
+
+    /// Whether the careful path applies. An unknown type counts as remote.
+    pub fn is_remote(&self) -> bool {
+        !matches!(self, Mount::Local { .. })
+    }
+
+    /// One line naming what this destination is.
+    pub fn describe(&self) -> String {
+        match self {
+            Mount::Local { file_system } => format!("a local {file_system} file system"),
+            Mount::Remote { file_system } => format!("a {file_system} network mount"),
+            Mount::Unknown => "a file system this tool cannot name".to_string(),
+        }
+    }
+
+    /// The guarantees that do not hold on this destination.
+    ///
+    /// A run prints these, because a person deciding whether to delete the source files
+    /// deserves to know which of them the tool can stand behind.
+    pub fn caveats(&self) -> Vec<String> {
+        if !self.is_remote() {
+            return Vec::new();
+        }
+        let mut lines = vec![
+            "flushing the directory entry does nothing here, so it proves nothing".to_string(),
+            "a rename error can report work that already succeeded, so both paths are read"
+                .to_string(),
+            "the read-back after the rename is the only confirmation this run trusts".to_string(),
+        ];
+        if matches!(self, Mount::Unknown) {
+            lines.push(
+                "the file system type could not be read, so the careful path is used".to_string(),
+            );
+        }
+        lines
+    }
+}
+
+/// The file system type of the mount point that holds `directory`.
+///
+/// `mountinfo` is the content of `/proc/self/mountinfo`. Its mount point is field five, and
+/// its type is the first field after the ` - ` separator. The longest mount point that is a
+/// prefix of the directory wins, because mounts nest.
+fn file_system_of(mountinfo: &str, directory: &Path) -> Option<String> {
+    let mut best: Option<(usize, String)> = None;
+    for line in mountinfo.lines() {
+        // A line this parser does not recognize is skipped, never fatal.
+        let Some((left, right)) = line.split_once(" - ") else {
+            continue;
+        };
+        let (Some(mount_point), Some(file_system)) = (
+            left.split_whitespace().nth(4),
+            right.split_whitespace().next(),
+        ) else {
+            continue;
+        };
+        if !directory.starts_with(mount_point) {
+            continue;
+        }
+        if best
+            .as_ref()
+            .is_none_or(|(len, _)| mount_point.len() > *len)
+        {
+            best = Some((mount_point.len(), file_system.to_string()));
+        }
+    }
+    best.map(|(_, file_system)| file_system)
+}
+
 /// A partly written output, sitting beside its destination under a temporary name.
 ///
 /// The temporary file is removed when this value is dropped, unless it was committed. So an
@@ -157,33 +300,112 @@ impl TempOutput {
     /// The destination exists when this returns. It has not been read back: that is the
     /// caller's next step, and it is the only confirmation worth trusting over a network
     /// mount.
-    pub fn commit(mut self) -> Result<()> {
+    pub fn commit(mut self, mount: &Mount) -> Result<Commit> {
         let file = self.file.take().expect("commit runs once");
+        let mut report = Commit::default();
 
         // A failed flush is never retried. The copy in the page cache is possibly gone, so
         // the only honest move is to abort and leave every source untouched.
-        file.sync_all()
-            .with_context(|| format!("flushing {}", self.temp.display()))?;
+        match file.sync_all() {
+            Ok(()) => {}
+            Err(error) if is_unsupported(&error) => {
+                // On Apple targets sync_all asks for F_FULLFSYNC, which a share rejects.
+                // That is not a failure, so fall back to the weaker flush and record that
+                // the guarantee is weaker than it looks.
+                file.sync_data().with_context(|| {
+                    format!("flushing {} after a downgrade", self.temp.display())
+                })?;
+                report.flush_downgraded = true;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("flushing {}", self.temp.display()))
+            }
+        }
 
         // Rust has no close that reports its result, and this crate contains no unsafe
         // code, so the file is closed by dropping it. The flush above reports a full disk,
         // and the read-back after the rename is what the safety rests on.
         drop(file);
 
-        std::fs::rename(&self.temp, &self.destination).with_context(|| {
-            format!(
-                "renaming {} to {}",
-                self.temp.display(),
-                self.destination.display()
-            )
-        })?;
+        self.rename_into_place(mount, &mut report)?;
         self.committed = true;
 
         if let Some(directory) = self.destination.parent() {
+            // The result is ignored on purpose. On NFS and SMB this call is a no-op that
+            // returns success, so neither outcome is evidence of anything.
             flush_directory(directory);
         }
-        Ok(())
+        Ok(report)
     }
+
+    /// Rename the temporary file into place, allowing for how a network mount behaves.
+    fn rename_into_place(&self, mount: &Mount, report: &mut Commit) -> Result<()> {
+        const ATTEMPTS: usize = 4;
+        let mut wait = Duration::from_millis(100);
+
+        for attempt in 1..=ATTEMPTS {
+            let error = match std::fs::rename(&self.temp, &self.destination) {
+                Ok(()) => return Ok(()),
+                Err(error) => error,
+            };
+
+            // A rename error does not prove the rename failed. RENAME is not idempotent,
+            // and on NFS below 4.1 a lost reply can be replayed, so the server reports an
+            // error for work it already did. Read both paths before concluding anything.
+            if mount.is_remote() && self.rename_already_happened() {
+                report.rename_error_was_wrong = true;
+                return Ok(());
+            }
+
+            // SMB fails renames for reasons that never occur locally: a destination held
+            // open without delete access, or an unreleased oplock. Both surface as these.
+            // Unlinking the destination first would work around them and would throw away
+            // the atomicity this whole sequence is paying for.
+            let worth_retrying = matches!(
+                error.kind(),
+                ErrorKind::PermissionDenied | ErrorKind::ResourceBusy | ErrorKind::Interrupted
+            );
+            if !worth_retrying || attempt == ATTEMPTS {
+                return Err(error).with_context(|| {
+                    format!(
+                        "renaming {} to {}",
+                        self.temp.display(),
+                        self.destination.display()
+                    )
+                });
+            }
+
+            report.rename_retries += 1;
+            std::thread::sleep(wait);
+            wait *= 2;
+        }
+        unreachable!("the loop returns on the last attempt")
+    }
+
+    /// Whether the rename already happened: the destination is there and the temporary name
+    /// is gone.
+    fn rename_already_happened(&self) -> bool {
+        self.destination.exists() && !self.temp.exists()
+    }
+}
+
+/// What the commit had to do, beyond the happy path.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Commit {
+    /// The strong flush was not supported here, so a weaker one was used.
+    pub flush_downgraded: bool,
+    /// How many times the rename was retried.
+    pub rename_retries: usize,
+    /// The rename reported an error for work it had already done.
+    pub rename_error_was_wrong: bool,
+}
+
+/// Whether an error means the call itself is not supported here.
+fn is_unsupported(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        ErrorKind::Unsupported | ErrorKind::InvalidInput
+    )
 }
 
 impl Drop for TempOutput {
@@ -300,7 +522,12 @@ mod tests {
         let temp = output.temp_path().to_path_buf();
         output.writer().write_all(b"the output").unwrap();
 
-        output.commit().unwrap();
+        let report = output.commit(&Mount::of(dir.path())).unwrap();
+        assert_eq!(
+            report,
+            Commit::default(),
+            "the happy path needs no fallback"
+        );
 
         assert!(!temp.exists(), "the temporary name is gone");
         let mut written = String::new();
@@ -309,6 +536,106 @@ mod tests {
             .read_to_string(&mut written)
             .unwrap();
         assert_eq!(written, "the output");
+    }
+
+    /// Two lines of a real `/proc/self/mountinfo`, with a share mounted below a local disk.
+    const MOUNTINFO: &str = "\
+25 30 0:23 / / rw,relatime shared:1 - ext4 /dev/sda1 rw
+41 25 0:44 / /mnt/backups rw,relatime shared:22 - nfs4 nas:/volume1 rw,vers=4.1
+47 41 0:51 / /mnt/backups/odd rw,relatime shared:9 - somethingnew /dev/x rw
+a line this parser does not understand";
+
+    #[test]
+    fn the_longest_mount_point_decides_the_file_system() {
+        let of = |path: &str| file_system_of(MOUNTINFO, Path::new(path));
+
+        assert_eq!(of("/var/tmp").as_deref(), Some("ext4"));
+        // The share is mounted below the root, so the longer prefix wins.
+        assert_eq!(of("/mnt/backups/set").as_deref(), Some("nfs4"));
+        assert_eq!(of("/mnt/backups/odd/set").as_deref(), Some("somethingnew"));
+    }
+
+    #[test]
+    fn a_network_mount_is_treated_as_one_and_says_what_does_not_hold() {
+        let remote = Mount::classify("nfs4");
+        assert_eq!(
+            remote,
+            Mount::Remote {
+                file_system: "nfs4".into()
+            }
+        );
+        assert!(remote.is_remote());
+        assert!(remote.describe().contains("nfs4"));
+        assert_eq!(remote.caveats().len(), 3);
+    }
+
+    #[test]
+    fn a_local_disk_carries_no_caveats() {
+        let local = Mount::classify("ext4");
+
+        assert!(!local.is_remote());
+        assert!(local.caveats().is_empty());
+    }
+
+    #[test]
+    fn a_file_system_this_tool_cannot_name_takes_the_careful_path() {
+        let unknown = Mount::classify("somethingnew");
+
+        assert_eq!(unknown, Mount::Unknown);
+        assert!(unknown.is_remote(), "an unknown type is treated as remote");
+        assert_eq!(unknown.caveats().len(), 4);
+    }
+
+    #[test]
+    fn a_rename_that_already_happened_is_recognized() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("MERGED-00-00.mrimgx");
+        let output = TempOutput::create(&destination).unwrap();
+        assert!(!output.rename_already_happened(), "nothing has moved yet");
+
+        std::fs::rename(output.temp_path(), &destination).unwrap();
+
+        assert!(
+            output.rename_already_happened(),
+            "the destination is there and the temporary name is gone"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_rename_refused_for_permission_is_retried_with_backoff() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let parent = tempfile::tempdir().unwrap();
+        let locked = parent.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        let destination = locked.join("MERGED-00-00.mrimgx");
+        let mut output = TempOutput::create(&destination).unwrap();
+        output.writer().write_all(b"the output").unwrap();
+        let temp = output.temp_path().to_path_buf();
+        // A directory that cannot be written is how SMB's refusals look from here.
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let started = std::time::Instant::now();
+        let error = output
+            .commit(&Mount::Remote {
+                file_system: "smb3".into(),
+            })
+            .unwrap_err();
+        let waited = started.elapsed();
+
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(error.to_string().contains("renaming"), "{error}");
+        // Three waits of 100, 200 and 400 milliseconds before the fourth attempt.
+        assert!(
+            waited >= Duration::from_millis(700),
+            "the retries did not back off: {waited:?}"
+        );
+        assert!(!destination.exists(), "the destination never appeared");
+        // The temporary file is still there, because a directory that refuses a rename
+        // refuses an unlink too. A real run cannot reach this state: the temporary file
+        // could not have been created in a directory that refuses writes.
+        assert!(temp.exists());
     }
 
     #[test]

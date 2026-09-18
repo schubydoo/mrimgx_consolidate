@@ -139,6 +139,14 @@ fn write_merge(set: &BackupSet, plan: &plan::MergePlan, out: &Path) -> Result<()
         .with_context(|| format!("{} has no usable file name", out.display()))?;
     let directory = out.parent().unwrap_or(Path::new("."));
 
+    // Classified before anything is written, because it decides what a rename is worth.
+    let mount = commit::Mount::of(directory);
+    println!();
+    println!("destination      {} on {}", out.display(), mount.describe());
+    for caveat in mount.caveats() {
+        println!("  note           {caveat}");
+    }
+
     let note = format!(
         "merging files {} through {}\noutput {}",
         plan.from,
@@ -159,7 +167,7 @@ fn write_merge(set: &BackupSet, plan: &plan::MergePlan, out: &Path) -> Result<()
         writer.flush()?;
         written
     };
-    temp.commit()?;
+    let committed = temp.commit(&mount)?;
 
     // Over a network mount only one confirmation is worth trusting: re-open the output and
     // read it back.
@@ -168,6 +176,15 @@ fn write_merge(set: &BackupSet, plan: &plan::MergePlan, out: &Path) -> Result<()
     println!();
     println!("wrote {} ({} bytes)", out.display(), written.size);
     println!("  read back and checked against the plan");
+    if committed.flush_downgraded {
+        println!("  the strong flush is not supported here, so a weaker one was used");
+    }
+    if committed.rename_retries > 0 {
+        println!("  the rename needed {} retries", committed.rename_retries);
+    }
+    if committed.rename_error_was_wrong {
+        println!("  the rename reported an error for work it had already done");
+    }
     println!("  these files are now redundant:");
     for number in plan.redundant_file_numbers() {
         if let Some(owner) = set.owner(number) {
