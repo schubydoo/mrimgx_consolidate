@@ -1198,6 +1198,102 @@ fn extract(oracle: &Path, backup: &Path, image: &Path) {
     );
 }
 
+/// Merge a range through the shipped command.
+fn merge(from: &Path, to: &Path, out: &Path) {
+    let run = std::process::Command::new(env!("CARGO_BIN_EXE_mrimgx-consolidate"))
+        .arg("consolidate")
+        .arg("--from")
+        .arg(from)
+        .arg("--to")
+        .arg(to)
+        .arg("--out")
+        .arg(out)
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "merging {} through {} failed: {}",
+        from.display(),
+        to.display(),
+        String::from_utf8_lossy(&run.stderr)
+    );
+}
+
+/// Compare two extractions, allowing for the `disk_size` difference between a Full and an
+/// Incremental. The shorter image must match over its whole length, and the tail of the
+/// longer one must be empty.
+fn compare_images(chain: &Path, merged: &Path) {
+    let chain_bytes = std::fs::read(chain).unwrap();
+    let merge_bytes = std::fs::read(merged).unwrap();
+    let common = chain_bytes.len().min(merge_bytes.len());
+
+    assert_eq!(
+        chain_bytes[..common],
+        merge_bytes[..common],
+        "the merged image differs from the chain image"
+    );
+    assert!(
+        chain_bytes[common..].iter().all(|b| *b == 0)
+            && merge_bytes[common..].iter().all(|b| *b == 0),
+        "the tail past the end of the shorter image is not empty"
+    );
+}
+
+#[test]
+fn a_merge_of_a_merge_still_resolves_and_extracts() {
+    // Re-consolidation is the case the alias closure exists for. The first output claims
+    // file numbers 0 and 1, so the second merge has to move blocks that are still tagged 0.
+    // A range test over file numbers would leave those behind and then delete the file that
+    // holds them.
+    let Some(dir) = corpus() else {
+        eprintln!("skipping: testdata/ is absent");
+        return;
+    };
+    let Some(oracle) = refextract() else {
+        eprintln!("skipping: build the oracle with scratch/build-refextract.sh");
+        return;
+    };
+    let source_dir = dir.join("Backup-Set-MP");
+    let name = |n: &str| format!("584221F3840B0DBE-MP-Full-{n}.mrimg");
+    if !source_dir.join(name("02-02")).exists() {
+        eprintln!("skipping: the multi-partition set is absent");
+        return;
+    }
+
+    let work = tempfile::tempdir().unwrap();
+    for part in ["00-00", "01-01", "02-02"] {
+        std::fs::copy(source_dir.join(name(part)), work.path().join(name(part))).unwrap();
+    }
+    let member = |n: &str| work.path().join(name(n));
+
+    // First merge: files 0 and 1. The two sources are then removed, as a person would.
+    let first = work.path().join("MERGED-FIRST.mrimg");
+    merge(&member("00-00"), &member("01-01"), &first);
+    std::fs::remove_file(member("00-00")).unwrap();
+    std::fs::remove_file(member("01-01")).unwrap();
+
+    // Second merge: that output with file 2.
+    let second = work.path().join("MERGED-SECOND.mrimg");
+    merge(&first, &member("02-02"), &second);
+    std::fs::remove_file(&first).unwrap();
+    std::fs::remove_file(member("02-02")).unwrap();
+
+    let output = BackupFile::open(&second, true).unwrap();
+    assert_eq!(output.header.file_number, 2);
+    assert_eq!(output.header.merged_files, vec![0, 1]);
+    assert!(!output.header.delta_index, "it carries a complete index");
+    // It claims every number of the chain it replaced, so it is a set on its own.
+    let set = BackupSet::discover(&second).unwrap();
+    assert_eq!(set.members.len(), 1);
+
+    let from_chain = work.path().join("chain.img");
+    extract(&oracle, &source_dir.join(name("02-02")), &from_chain);
+    let from_merge = work.path().join("merge.img");
+    extract(&oracle, &second, &from_merge);
+
+    compare_images(&from_chain, &from_merge);
+}
+
 #[test]
 fn the_merge_extracts_to_the_same_image_as_the_chain() {
     // The gold standard. A second implementation, by different authors, restores the
